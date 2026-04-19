@@ -143,8 +143,6 @@ def voltage_to_diameter(V: np.ndarray, params: DMAParameters,
     # return dp_corrected
 
 
-
-
 def diameter_to_voltage(dp_nm: np.ndarray, params: DMAParameters,
                          n_charges: int = 1) -> np.ndarray:
     """Compute DMA voltage corresponding to each diameter."""
