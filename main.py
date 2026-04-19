@@ -5,10 +5,10 @@ Entry point. Run with:  python main.py
 """
 
 import sys
-# import os
+import os
 
 # --- Ensure project root is on the path ---
-# sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(__file__))
 
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import Qt
