@@ -16,7 +16,7 @@ the GUI layer decide which columns map to which role.
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class AerosolDataset:
@@ -30,6 +30,14 @@ class AerosolDataset:
         self.diameters: Optional[np.ndarray] = None       # particle diameters [nm]
         self.filepath: Optional[str] = None
         self.column_roles: dict = {}   # mapping: 'time', 'diameter', 'counts', 'meta'
+
+        # TSI-specific fields (populated by load_tsi())
+        self.tsi_meta: Optional[Dict[str, Any]] = None       # instrument header block
+        self.tsi_scan_meta: Optional[List[dict]] = None      # per-scan metadata
+        self.raw_counts: Optional[np.ndarray] = None         # (n_scans, n_times)
+        self.raw_times: Optional[np.ndarray] = None          # time axis [s] for raw counts
+        self.raw_diameters: Optional[np.ndarray] = None      # (n_scans, n_times) diameters [nm]
+        self.dead_time_counts: Optional[np.ndarray] = None   # (n_scans, n_times)
 
     # ------------------------------------------------------------------
     # I/O
@@ -68,6 +76,74 @@ class AerosolDataset:
 
         if time_col and diameter_cols:
             self.set_column_roles(time_col, diameter_cols, meta_cols or [])
+
+    def load_tsi(self, filepath: str, sheet_name: Any = 0) -> "TSIResult":  # noqa: F821
+        """
+        Load a TSI SMPS Excel export file.
+
+        Populates the standard AerosolDataset fields using the dN/dlogDp
+        concentration block as the primary count_matrix (best for
+        visualisation).  Raw count data, if present in the sheet, is stored
+        in the tsi_* extra attributes for use by the inversion pipeline.
+
+        Parameters
+        ----------
+        filepath   : path to the .xlsx file
+        sheet_name : sheet to read — name (str) or 0-based index (int)
+
+        Returns
+        -------
+        TSIResult  – the parsed TSI data object (also stored on the dataset
+                     so callers can access instrument_hints() etc.)
+        """
+        from modules.tsi_loader import load_tsi_xlsx
+        import pandas as pd
+
+        tsi = load_tsi_xlsx(filepath, sheet_name)
+
+        self.filepath = str(filepath)
+
+        # --- standard fields from dN/dlogDp block ---
+        self.diameters = tsi.diameters_dn.copy()
+        self.count_matrix = tsi.dn_matrix.copy() if tsi.dn_matrix is not None else None
+
+        # --- scan start times ---
+        if tsi.scan_datetimes:
+            try:
+                self.times = pd.to_datetime(tsi.scan_datetimes, dayfirst=True).values
+            except Exception:
+                self.times = np.array(tsi.scan_datetimes)
+        else:
+            self.times = np.arange(tsi.n_scans, dtype=float)
+
+        # --- a minimal raw_df so the column-list helpers keep working ---
+        # Columns: DateTime + one column per diameter bin
+        dp_cols = [f"{d:.3f}" for d in self.diameters]
+        if self.count_matrix is not None:
+            df_data = {
+                "DateTime": list(tsi.scan_datetimes),
+                **{dp_cols[k]: self.count_matrix[:, k]
+                   for k in range(self.count_matrix.shape[1])},
+            }
+        else:
+            df_data = {"DateTime": list(tsi.scan_datetimes)}
+        self.raw_df = pd.DataFrame(df_data)
+
+        self.column_roles = {
+            "time":      "DateTime",
+            "diameters": dp_cols,
+            "meta":      [],
+        }
+
+        # --- TSI-specific extras ---
+        self.tsi_meta       = tsi.instrument_meta
+        self.tsi_scan_meta  = tsi.scan_meta
+        self.raw_counts      = tsi.raw_counts
+        self.raw_times       = tsi.raw_times
+        self.raw_diameters   = tsi.raw_diameters
+        self.dead_time_counts = tsi.dead_time_counts
+
+        return tsi
 
     def set_column_roles(self, time_col: str,
                          diameter_cols: list,
@@ -195,13 +271,17 @@ class AerosolDataset:
     def summary(self) -> str:
         if self.raw_df is None:
             return "No dataset loaded."
-        return (
+        base = (
             f"File   : {self.filepath}\n"
             f"Scans  : {self.n_scans}\n"
             f"Bins   : {self.n_bins}\n"
-            f"Diam   : {self.diameters[0]:.1f} – {self.diameters[-1]:.1f} nm\n"
-            f"Columns: {', '.join(self.columns)}"
+            f"Diam   : {self.diameters[0]:.1f} – {self.diameters[-1]:.1f} nm"
         ) if self.count_matrix is not None else (
             f"File loaded ({len(self.raw_df)} rows, {len(self.raw_df.columns)} cols). "
-            f"Column roles not yet assigned."
+            "Column roles not yet assigned."
         )
+        extra = ""
+        if self.raw_counts is not None:
+            extra = (f"\nRaw cts: {self.raw_counts.shape[0]} scans × "
+                     f"{self.raw_counts.shape[1]} time steps")
+        return base + extra

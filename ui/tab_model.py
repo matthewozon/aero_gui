@@ -346,5 +346,63 @@ class ModelTab(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Save error", str(e))
 
+    def seed_from_tsi(self, hints: dict) -> None:
+        """
+        Update parameter spin-boxes from instrument hints extracted by
+        TSIResult.instrument_hints().
+
+        Seeded parameters
+        -----------------
+        temperature_K       → Temperature (K) spin-box
+        pressure_Pa         → Pressure (Pa) spin-box
+        tube_length_cm      → DMA length spin-box
+        sheath_flow_Lmin    → Sheath flow spin-box
+        aerosol_flow_Lmin   → Sample flow spin-box
+        v_min_V             → V min spin-box
+        v_max_V             → V max spin-box
+        n_dp_bins           → Channels spin-box
+        impactor_d50_nm     → Impactor D50 spin-box
+        hv_polarity         → Max charges sign (negative → negative Nq)
+        """
+        seeded = []
+
+        def _set(spn, key, scale=1.0, label=""):
+            if key in hints:
+                val = hints[key] * scale
+                lo, hi = spn.minimum(), spn.maximum()
+                if lo <= val <= hi:
+                    spn.setValue(val)
+                    seeded.append(label or key)
+
+        _set(self.spn_T,   'temperature_K',    label="T")
+        _set(self.spn_P,   'pressure_Pa',       label="P")
+        _set(self.spn_L,   'tube_length_cm',    label="L")
+        _set(self.spn_Qsh, 'sheath_flow_Lmin',  label="Qsh")
+        _set(self.spn_Qa,  'aerosol_flow_Lmin', label="Qa")
+        _set(self.spn_Vmin,'v_min_V',           label="Vmin")
+        _set(self.spn_Vmax,'v_max_V',           label="Vmax")
+        _set(self.spn_imp_d50, 'impactor_d50_nm', label="imp D50")
+
+        if 'n_dp_bins' in hints:
+            n = int(hints['n_dp_bins'])
+            if self.spn_nch.minimum() <= n <= self.spn_nch.maximum():
+                self.spn_nch.setValue(n)
+                seeded.append("n_channels")
+
+        if 'hv_polarity' in hints:
+            polarity = hints['hv_polarity']
+            nq = abs(self.spn_Nq.value())
+            if 'neg' in polarity:
+                self.spn_Nq.setValue(-nq)
+            elif 'pos' in polarity:
+                self.spn_Nq.setValue(nq)
+            seeded.append("polarity")
+
+        self._update_air_props()
+        if seeded:
+            self._log("Seeded from TSI metadata: " + ", ".join(seeded))
+        else:
+            self._log("No seedable parameters found in TSI metadata.")
+
     def _log(self, msg: str):
         self.log.append(msg)

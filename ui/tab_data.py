@@ -2,17 +2,29 @@
 ui/tab_data.py
 --------------
 Tab 1: Data loading, visualisation (heatmap + time series), manipulation, export.
+
+Supports two loading modes selected via the "File Format" combo:
+
+  Generic (CSV / Excel)
+      Original behaviour: open any tabular file, then manually assign
+      which column is the time axis and which are the diameter/count bins.
+
+  TSI SMPS (xlsx)
+      Specialised loader for TSI AIM software exports.  The file structure
+      is parsed automatically; the sheet to read is selected via a combo box
+      that appears after the file is opened.  Instrument metadata extracted
+      from the file can be forwarded to the Measurement Model tab with the
+      "Seed Model Tab" button.
 """
 
 import numpy as np
-import pandas as pd
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QComboBox, QLabel, QFileDialog,
-    QGroupBox, QCheckBox, QLineEdit, QDoubleSpinBox,
-    QSplitter, QListWidget, QListWidgetItem, QTextEdit,
-    QTabWidget, QMessageBox, QAbstractItemView
+    QGroupBox, QCheckBox, QDoubleSpinBox,
+    QSplitter, QListWidget, QTextEdit,
+    QTabWidget, QMessageBox, QAbstractItemView,
 )
 from PyQt5.QtCore import Qt
 
@@ -21,8 +33,6 @@ matplotlib.use("Qt5Agg")
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 
 from modules.data_model import AerosolDataset
 
@@ -32,6 +42,7 @@ class DataTab(QWidget):
         super().__init__(parent)
         self.dataset = dataset
         self.main_window = parent
+        self._tsi_result = None   # last TSIResult (for seeding the model tab)
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -46,22 +57,61 @@ class DataTab(QWidget):
         left.setSpacing(8)
         left_w = QWidget()
         left_w.setLayout(left)
-        left_w.setFixedWidth(280)
+        left_w.setFixedWidth(290)
 
-        # File loading
+        # ── File format selector ──────────────────────────────────────
+        grp_fmt = QGroupBox("File Format")
+        fmt_l = QVBoxLayout(grp_fmt)
+        self.cmb_format = QComboBox()
+        self.cmb_format.addItems(["Generic (CSV / Excel)", "TSI SMPS (xlsx)"])
+        self.cmb_format.currentIndexChanged.connect(self._on_format_changed)
+        fmt_l.addWidget(self.cmb_format)
+        left.addWidget(grp_fmt)
+
+        # ── Data file – stacked for Generic / TSI ────────────────────
         grp_file = QGroupBox("Data File")
-        fl = QVBoxLayout(grp_file)
-        self.btn_open = QPushButton("Open CSV / Excel…")
-        self.btn_open.clicked.connect(self.open_file_dialog)
+        file_l = QVBoxLayout(grp_file)
+
+        # Generic open button
+        self.btn_open_generic = QPushButton("Open CSV / Excel…")
+        self.btn_open_generic.clicked.connect(self._open_generic)
+        file_l.addWidget(self.btn_open_generic)
+
+        # TSI open button + sheet selector
+        self.btn_open_tsi = QPushButton("Open TSI SMPS xlsx…")
+        self.btn_open_tsi.clicked.connect(self._open_tsi)
+        self.btn_open_tsi.setVisible(False)
+        file_l.addWidget(self.btn_open_tsi)
+
+        self._lbl_sheet = QLabel("Sheet:")
+        self._lbl_sheet.setVisible(False)
+        self.cmb_sheet = QComboBox()
+        self.cmb_sheet.setVisible(False)
+        self.cmb_sheet.currentIndexChanged.connect(self._on_sheet_changed)
+        sheet_row = QHBoxLayout()
+        sheet_row.addWidget(self._lbl_sheet)
+        sheet_row.addWidget(self.cmb_sheet)
+        file_l.addLayout(sheet_row)
+
         self.lbl_file = QLabel("No file loaded.")
         self.lbl_file.setWordWrap(True)
-        fl.addWidget(self.btn_open)
-        fl.addWidget(self.lbl_file)
+        file_l.addWidget(self.lbl_file)
+
+        # TSI-only: seed model button
+        self.btn_seed_model = QPushButton("Seed Measurement Model →")
+        self.btn_seed_model.setVisible(False)
+        self.btn_seed_model.setToolTip(
+            "Transfer instrument parameters extracted from the TSI file\n"
+            "to the Measurement Model tab spin-boxes."
+        )
+        self.btn_seed_model.clicked.connect(self._seed_model_tab)
+        file_l.addWidget(self.btn_seed_model)
+
         left.addWidget(grp_file)
 
-        # Column assignment
-        grp_cols = QGroupBox("Column Roles")
-        cl = QGridLayout(grp_cols)
+        # ── Column assignment (Generic mode only) ─────────────────────
+        self.grp_cols = QGroupBox("Column Roles")
+        cl = QGridLayout(self.grp_cols)
         cl.addWidget(QLabel("Time column:"), 0, 0)
         self.cmb_time = QComboBox(); cl.addWidget(self.cmb_time, 0, 1)
         cl.addWidget(QLabel("Count columns:"), 1, 0)
@@ -72,44 +122,65 @@ class DataTab(QWidget):
         self.btn_apply_cols = QPushButton("Apply column mapping")
         self.btn_apply_cols.clicked.connect(self._apply_column_mapping)
         cl.addWidget(self.btn_apply_cols, 3, 0, 1, 2)
-        left.addWidget(grp_cols)
+        left.addWidget(self.grp_cols)
 
-        # Visualisation options
+        # ── Visualisation options ─────────────────────────────────────
         grp_viz = QGroupBox("Visualisation")
         vl = QGridLayout(grp_viz)
-        vl.addWidget(QLabel("Colour map:"), 0, 0)
+        vl.addWidget(QLabel("Data source:"), 0, 0)
+        self.cmb_data_src = QComboBox()
+        self.cmb_data_src.addItems(["dN/dlogDp (concentration)", "Raw counts"])
+        vl.addWidget(self.cmb_data_src, 0, 1)
+        vl.addWidget(QLabel("Colour map:"), 1, 0)
         self.cmb_cmap = QComboBox()
         self.cmb_cmap.addItems(["viridis", "plasma", "inferno", "magma",
                                  "jet", "turbo", "RdYlBu_r"])
-        vl.addWidget(self.cmb_cmap, 0, 1)
+        vl.addWidget(self.cmb_cmap, 1, 1)
         self.chk_log_color = QCheckBox("Log colour scale")
         self.chk_log_color.setChecked(True)
-        vl.addWidget(self.chk_log_color, 1, 0, 1, 2)
+        vl.addWidget(self.chk_log_color, 2, 0, 1, 2)
         self.chk_log_y = QCheckBox("Log Y axis (diameter)")
         self.chk_log_y.setChecked(True)
-        vl.addWidget(self.chk_log_y, 2, 0, 1, 2)
+        vl.addWidget(self.chk_log_y, 3, 0, 1, 2)
         self.btn_plot_heat = QPushButton("Plot 2D Heatmap")
         self.btn_plot_heat.clicked.connect(self._plot_heatmap)
-        vl.addWidget(self.btn_plot_heat, 3, 0, 1, 2)
+        vl.addWidget(self.btn_plot_heat, 4, 0, 1, 2)
         left.addWidget(grp_viz)
 
-        # 1D time series
-        grp_ts = QGroupBox("1D Time Series")
+        # ── 1D plot ───────────────────────────────────────────────────
+        grp_ts = QGroupBox("1D Plot")
         tsl = QGridLayout(grp_ts)
-        tsl.addWidget(QLabel("Diam min (nm):"), 0, 0)
+
+        tsl.addWidget(QLabel("Mode:"), 0, 0)
+        self.cmb_ts_mode = QComboBox()
+        self.cmb_ts_mode.addItems([
+            "Sum over Dp range vs. scan",
+            "Size distribution (one scan)",
+            "Single Dp vs. scan",
+        ])
+        self.cmb_ts_mode.currentIndexChanged.connect(self._on_ts_mode_changed)
+        tsl.addWidget(self.cmb_ts_mode, 0, 1)
+
+        # Row 1 — label + widget A
+        self._lbl_ts_a = QLabel("Diam min (nm):")
+        tsl.addWidget(self._lbl_ts_a, 1, 0)
         self.spn_d_min = QDoubleSpinBox()
         self.spn_d_min.setRange(1, 1e6); self.spn_d_min.setValue(10)
-        tsl.addWidget(self.spn_d_min, 0, 1)
-        tsl.addWidget(QLabel("Diam max (nm):"), 1, 0)
+        tsl.addWidget(self.spn_d_min, 1, 1)
+
+        # Row 2 — label + widget B (hidden for some modes)
+        self._lbl_ts_b = QLabel("Diam max (nm):")
+        tsl.addWidget(self._lbl_ts_b, 2, 0)
         self.spn_d_max = QDoubleSpinBox()
         self.spn_d_max.setRange(1, 1e6); self.spn_d_max.setValue(1000)
-        tsl.addWidget(self.spn_d_max, 1, 1)
-        self.btn_plot_ts = QPushButton("Plot Time Series")
+        tsl.addWidget(self.spn_d_max, 2, 1)
+
+        self.btn_plot_ts = QPushButton("Plot")
         self.btn_plot_ts.clicked.connect(self._plot_time_series)
-        tsl.addWidget(self.btn_plot_ts, 2, 0, 1, 2)
+        tsl.addWidget(self.btn_plot_ts, 3, 0, 1, 2)
         left.addWidget(grp_ts)
 
-        # Export
+        # ── Export ────────────────────────────────────────────────────
         grp_exp = QGroupBox("Export Subset")
         el = QVBoxLayout(grp_exp)
         self.lst_export_cols = QListWidget()
@@ -129,7 +200,6 @@ class DataTab(QWidget):
         right_w = QWidget()
         right_w.setLayout(right)
 
-        # Two plot areas in a sub-tab
         self.plot_tabs = QTabWidget()
 
         # Heatmap figure
@@ -155,7 +225,7 @@ class DataTab(QWidget):
         # Log / summary
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMaximumHeight(120)
+        self.log.setMaximumHeight(150)
 
         right.addWidget(self.plot_tabs)
         right.addWidget(QLabel("Log:"))
@@ -170,10 +240,53 @@ class DataTab(QWidget):
         root.addWidget(splitter)
 
     # ------------------------------------------------------------------
-    # Slots
+    # Format switching
+    # ------------------------------------------------------------------
+
+    def _on_ts_mode_changed(self, index: int):
+        """Show/hide the correct parameter rows for the selected 1D plot mode."""
+        # 0 = Sum over Dp range  →  Diam min + Diam max
+        # 1 = Size distribution  →  Scan index
+        # 2 = Single Dp vs scan  →  Diameter (nm)
+        labels = ["Diam min (nm):", "Scan index:", "Diameter (nm):"]
+        self._lbl_ts_a.setText(labels[index])
+
+        show_b = (index == 0)
+        self._lbl_ts_b.setVisible(show_b)
+        self.spn_d_max.setVisible(show_b)
+
+        if index == 1:          # scan index: integer steps, reset range after data loaded
+            self.spn_d_min.setDecimals(0)
+            self.spn_d_min.setRange(0, 9999)
+            self.spn_d_min.setValue(0)
+            self.spn_d_min.setSingleStep(1)
+        else:
+            self.spn_d_min.setDecimals(2)
+            self.spn_d_min.setRange(1, 1e6)
+            self.spn_d_min.setSingleStep(1.0)
+            if index == 0:
+                self.spn_d_min.setValue(10)
+            else:
+                self.spn_d_min.setValue(100)
+
+    def _on_format_changed(self, index: int):
+        is_tsi = (index == 1)
+        self.btn_open_generic.setVisible(not is_tsi)
+        self.btn_open_tsi.setVisible(is_tsi)
+        self._lbl_sheet.setVisible(False)
+        self.cmb_sheet.setVisible(False)
+        self.btn_seed_model.setVisible(False)
+        self.grp_cols.setVisible(not is_tsi)
+
+    # ------------------------------------------------------------------
+    # Generic loading (original behaviour)
     # ------------------------------------------------------------------
 
     def open_file_dialog(self):
+        """Called by the main-window File menu (always uses generic mode)."""
+        self._open_generic()
+
+    def _open_generic(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open data file", "",
             "Data files (*.csv *.xlsx *.xls);;All files (*)"
@@ -192,14 +305,11 @@ class DataTab(QWidget):
 
     def _populate_column_lists(self):
         cols = self.dataset.columns
-        # Time combo
         self.cmb_time.clear()
         self.cmb_time.addItems(cols)
-        # Count column list
         self.lst_count_cols.clear()
         for c in cols:
             self.lst_count_cols.addItem(c)
-        # Export columns
         self.lst_export_cols.clear()
         for c in cols:
             self.lst_export_cols.addItem(c)
@@ -220,20 +330,118 @@ class DataTab(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
-    def _plot_heatmap(self):
-        if self.dataset.count_matrix is None:
-            QMessageBox.warning(self, "No data", "Apply column mapping first.")
+    # ------------------------------------------------------------------
+    # TSI loading
+    # ------------------------------------------------------------------
+
+    def _open_tsi(self):
+        from modules.tsi_loader import list_sheets
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open TSI SMPS file", "",
+            "TSI Excel files (*.xlsx *.xls);;All files (*)"
+        )
+        if not path:
             return
 
+        # Populate sheet selector
+        try:
+            sheets = list_sheets(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Load error", str(e))
+            return
+
+        self._tsi_path = path
+        self.cmb_sheet.blockSignals(True)
+        self.cmb_sheet.clear()
+        self.cmb_sheet.addItems(sheets)
+        self.cmb_sheet.blockSignals(False)
+
+        self._lbl_sheet.setVisible(True)
+        self.cmb_sheet.setVisible(True)
+        self.lbl_file.setText(path.split("/")[-1])
+
+        # Load first sheet immediately
+        self._load_tsi_sheet(path, self.cmb_sheet.currentText())
+
+    def _on_sheet_changed(self, _sheet_index: int):
+        if hasattr(self, '_tsi_path') and self._tsi_path:
+            self._load_tsi_sheet(self._tsi_path, self.cmb_sheet.currentText())
+
+    def _load_tsi_sheet(self, path: str, sheet_name: str):
+        try:
+            tsi = self.dataset.load_tsi(path, sheet_name)
+            self._tsi_result = tsi
+        except Exception as e:
+            QMessageBox.critical(self, "TSI load error", str(e))
+            return
+
+        # Auto-populate export column list from dataset columns
+        self.lst_export_cols.clear()
+        for c in self.dataset.columns:
+            self.lst_export_cols.addItem(c)
+
+        # Show seed button
+        self.btn_seed_model.setVisible(True)
+
+        # Log instrument summary
+        self._log(f"TSI file: {path.split('/')[-1]}  [sheet: {sheet_name}]")
+        self._log(tsi.summary())
+
+        if self.main_window:
+            self.main_window.set_status(
+                f"TSI loaded — {tsi.n_scans} scans, "
+                f"{len(tsi.diameters_dn)} dp bins  [{sheet_name}]"
+            )
+
+    # ------------------------------------------------------------------
+    # Seed model tab
+    # ------------------------------------------------------------------
+
+    def _seed_model_tab(self):
+        if self._tsi_result is None:
+            return
+        if self.main_window is None:
+            return
+        hints = self._tsi_result.instrument_hints()
+        try:
+            self.main_window.tab_model.seed_from_tsi(hints)
+            self.main_window.tabs.setCurrentWidget(self.main_window.tab_model)
+            self._log("Instrument parameters forwarded to Measurement Model tab.")
+        except Exception as e:
+            QMessageBox.critical(self, "Seed error", str(e))
+
+    # ------------------------------------------------------------------
+    # Plots
+    # ------------------------------------------------------------------
+
+    def _plot_heatmap(self):
+        use_raw = self.cmb_data_src.currentIndex() == 1
+
+        if use_raw:
+            if self.dataset.raw_counts is None:
+                QMessageBox.warning(self, "No raw data",
+                                    "Raw counts are not available for this dataset.\n"
+                                    "Load a TSI file that contains raw count data.")
+                return
+            self._plot_heatmap_raw()
+        else:
+            if self.dataset.count_matrix is None:
+                QMessageBox.warning(self, "No data",
+                                    "Load data and apply column mapping first.")
+                return
+            self._plot_heatmap_dn()
+
+    def _plot_heatmap_dn(self):
+        """2-D heatmap of the dN/dlogDp concentration grid."""
         C = self.dataset.get_counts(log_scale=self.chk_log_color.isChecked())
-        times = np.arange(self.dataset.n_scans)  # fallback: scan index
+        times = np.arange(self.dataset.n_scans)
         dp = self.dataset.diameters
 
         self.fig_heat.clear()
         ax = self.fig_heat.add_subplot(111)
         ax.set_facecolor("#181825")
 
-        # Pcolormesh: x=time, y=diameter, z=counts
         T, D = np.meshgrid(times, dp)
         mesh = ax.pcolormesh(T, D, C.T,
                               cmap=self.cmb_cmap.currentText(),
@@ -241,15 +449,62 @@ class DataTab(QWidget):
         cbar = self.fig_heat.colorbar(mesh, ax=ax)
         cbar.ax.yaxis.label.set_color("#cdd6f4")
         cbar.ax.tick_params(colors="#cdd6f4")
-        label = "log₁₀(counts)" if self.chk_log_color.isChecked() else "Counts"
-        cbar.set_label(label, color="#cdd6f4")
+        clabel = "log₁₀(dN/dlogDp)" if self.chk_log_color.isChecked() else "dN/dlogDp"
+        cbar.set_label(clabel, color="#cdd6f4")
 
         if self.chk_log_y.isChecked():
             ax.set_yscale("log")
-
         ax.set_xlabel("Scan index", color="#cdd6f4")
         ax.set_ylabel("Diameter (nm)", color="#cdd6f4")
-        ax.set_title("Particle Size Distribution – 2D Heatmap", color="#cdd6f4")
+        ax.set_title("dN/dlogDp – 2D Heatmap", color="#cdd6f4")
+        ax.tick_params(colors="#cdd6f4")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#45475a")
+
+        self.fig_heat.tight_layout()
+        self.canvas_heat.draw()
+        self.plot_tabs.setCurrentIndex(0)
+
+    def _plot_heatmap_raw(self):
+        """
+        2-D heatmap of raw counts.
+
+        X axis  : scan index
+        Y axis  : diameter [nm] selected at each time step within the scan
+                  (taken from the first scan; the voltage programme is identical
+                  for all scans)
+        Colour  : raw counts (optionally log-scaled)
+        """
+        C = self.dataset.raw_counts.copy()   # (n_scans, n_times)
+        dp = self.dataset.raw_diameters[0]   # diameter per time step [nm]
+
+        if self.chk_log_color.isChecked():
+            C = C.astype(float)
+            C[C <= 0] = np.nan
+            C = np.log10(C)
+
+        scans = np.arange(self.dataset.raw_counts.shape[0])
+
+        self.fig_heat.clear()
+        ax = self.fig_heat.add_subplot(111)
+        ax.set_facecolor("#181825")
+
+        # pcolormesh: x = scan index, y = diameter per time step, z = counts
+        T, D = np.meshgrid(scans, dp)
+        mesh = ax.pcolormesh(T, D, C.T,
+                              cmap=self.cmb_cmap.currentText(),
+                              shading="auto")
+        cbar = self.fig_heat.colorbar(mesh, ax=ax)
+        cbar.ax.yaxis.label.set_color("#cdd6f4")
+        cbar.ax.tick_params(colors="#cdd6f4")
+        clabel = "log₁₀(counts)" if self.chk_log_color.isChecked() else "Counts"
+        cbar.set_label(clabel, color="#cdd6f4")
+
+        if self.chk_log_y.isChecked():
+            ax.set_yscale("log")
+        ax.set_xlabel("Scan index", color="#cdd6f4")
+        ax.set_ylabel("Diameter (nm)", color="#cdd6f4")
+        ax.set_title("Raw counts – 2D Heatmap", color="#cdd6f4")
         ax.tick_params(colors="#cdd6f4")
         for spine in ax.spines.values():
             spine.set_edgecolor("#45475a")
@@ -259,33 +514,143 @@ class DataTab(QWidget):
         self.plot_tabs.setCurrentIndex(0)
 
     def _plot_time_series(self):
-        if self.dataset.count_matrix is None:
-            QMessageBox.warning(self, "No data", "Apply column mapping first.")
-            return
+        mode    = self.cmb_ts_mode.currentIndex()
+        use_raw = self.cmb_data_src.currentIndex() == 1
+        {0: self._plot_ts_summed, 1: self._plot_ts_scan_slice,
+         2: self._plot_ts_dp_slice}[mode](use_raw)
 
+    # -- mode 0: sum over Dp range vs. scan --------------------------------
+
+    def _plot_ts_summed(self, use_raw: bool):
         d_min = self.spn_d_min.value()
         d_max = self.spn_d_max.value()
-        ts = self.dataset.sum_over_diameter_range(d_min, d_max)
-        times = np.arange(self.dataset.n_scans)
+
+        if use_raw:
+            if self.dataset.raw_counts is None:
+                QMessageBox.warning(self, "No raw data",
+                                    "Raw counts are not available for this dataset.")
+                return
+            dp   = self.dataset.raw_diameters
+            mask = (dp >= d_min) & (dp <= d_max)
+            ts   = np.where(mask, self.dataset.raw_counts, 0).sum(axis=1)
+            ylabel = "Total raw counts"
+            title  = f"Raw counts {d_min:.0f}–{d_max:.0f} nm vs. scan"
+        else:
+            if self.dataset.count_matrix is None:
+                QMessageBox.warning(self, "No data",
+                                    "Load data and apply column mapping first.")
+                return
+            ts     = self.dataset.sum_over_diameter_range(d_min, d_max)
+            ylabel = "Total dN/dlogDp"
+            title  = f"dN/dlogDp {d_min:.0f}–{d_max:.0f} nm vs. scan"
+
+        self._draw_ts_scan(np.arange(len(ts)), ts, "Scan index", ylabel, title)
+
+    # -- mode 1: full size distribution for one scan -----------------------
+
+    def _plot_ts_scan_slice(self, use_raw: bool):
+        scan_idx = int(self.spn_d_min.value())
+
+        if use_raw:
+            if self.dataset.raw_counts is None:
+                QMessageBox.warning(self, "No raw data",
+                                    "Raw counts are not available for this dataset.")
+                return
+            n = self.dataset.raw_counts.shape[0]
+            if not (0 <= scan_idx < n):
+                QMessageBox.warning(self, "Index out of range",
+                                    f"Scan index must be 0–{n - 1}.")
+                return
+            dp  = self.dataset.raw_diameters[scan_idx]   # (n_times,)
+            y   = self.dataset.raw_counts[scan_idx]       # (n_times,)
+            # sort by diameter so the line makes sense
+            order = np.argsort(dp)
+            dp, y = dp[order], y[order]
+            ylabel = "Raw counts"
+            title  = f"Raw counts – scan {scan_idx}"
+        else:
+            if self.dataset.count_matrix is None:
+                QMessageBox.warning(self, "No data",
+                                    "Load data and apply column mapping first.")
+                return
+            n = self.dataset.n_scans
+            if not (0 <= scan_idx < n):
+                QMessageBox.warning(self, "Index out of range",
+                                    f"Scan index must be 0–{n - 1}.")
+                return
+            dp  = self.dataset.diameters
+            y   = self.dataset.count_matrix[scan_idx]
+            ylabel = "dN/dlogDp"
+            title  = f"Size distribution – scan {scan_idx}"
 
         self.fig_ts.clear()
         ax = self.fig_ts.add_subplot(111)
         ax.set_facecolor("#181825")
-        ax.plot(times, ts, color="#89b4fa", linewidth=1.5)
-        ax.fill_between(times, ts, alpha=0.25, color="#89b4fa")
-        ax.set_xlabel("Scan index", color="#cdd6f4")
-        ax.set_ylabel("Total counts", color="#cdd6f4")
-        ax.set_title(
-            f"Total counts {d_min:.0f}–{d_max:.0f} nm vs. scan index",
-            color="#cdd6f4"
-        )
+        ax.plot(dp, y, color="#a6e3a1", linewidth=1.5)
+        ax.fill_between(dp, y, alpha=0.2, color="#a6e3a1")
+        if self.chk_log_y.isChecked():
+            ax.set_xscale("log")
+        ax.set_xlabel("Diameter (nm)", color="#cdd6f4")
+        ax.set_ylabel(ylabel, color="#cdd6f4")
+        ax.set_title(title, color="#cdd6f4")
         ax.tick_params(colors="#cdd6f4")
         for spine in ax.spines.values():
             spine.set_edgecolor("#45475a")
-
         self.fig_ts.tight_layout()
         self.canvas_ts.draw()
         self.plot_tabs.setCurrentIndex(1)
+
+    # -- mode 2: single diameter vs. scan ----------------------------------
+
+    def _plot_ts_dp_slice(self, use_raw: bool):
+        dp_target = self.spn_d_min.value()
+
+        if use_raw:
+            if self.dataset.raw_counts is None:
+                QMessageBox.warning(self, "No raw data",
+                                    "Raw counts are not available for this dataset.")
+                return
+            # For each scan pick the time step whose diameter is closest to dp_target
+            dp_arr = self.dataset.raw_diameters   # (n_scans, n_times)
+            idx    = np.argmin(np.abs(dp_arr - dp_target), axis=1)
+            y      = self.dataset.raw_counts[np.arange(len(idx)), idx]
+            dp_actual = dp_arr[np.arange(len(idx)), idx].mean()
+            ylabel = "Raw counts"
+            title  = f"Raw counts at Dp ≈ {dp_actual:.1f} nm vs. scan"
+        else:
+            if self.dataset.count_matrix is None:
+                QMessageBox.warning(self, "No data",
+                                    "Load data and apply column mapping first.")
+                return
+            idx       = int(np.argmin(np.abs(self.dataset.diameters - dp_target)))
+            dp_actual = self.dataset.diameters[idx]
+            y         = self.dataset.count_matrix[:, idx]
+            ylabel    = "dN/dlogDp"
+            title     = f"dN/dlogDp at Dp = {dp_actual:.1f} nm vs. scan"
+
+        self._draw_ts_scan(np.arange(len(y)), y, "Scan index", ylabel, title)
+
+    # -- shared draw helper ------------------------------------------------
+
+    def _draw_ts_scan(self, x, y, xlabel, ylabel, title):
+        self.fig_ts.clear()
+        ax = self.fig_ts.add_subplot(111)
+        ax.set_facecolor("#181825")
+        ax.plot(x, y, color="#89b4fa", linewidth=1.5)
+        ax.fill_between(x, y, alpha=0.25, color="#89b4fa")
+        ax.set_xlabel(xlabel, color="#cdd6f4")
+        ax.set_ylabel(ylabel, color="#cdd6f4")
+        ax.set_title(title, color="#cdd6f4")
+        ax.tick_params(colors="#cdd6f4")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#45475a")
+        self.fig_ts.tight_layout()
+        self.canvas_ts.draw()
+        self.plot_tabs.setCurrentIndex(1)
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
 
     def _export_subset(self):
         cols = [item.text() for item in self.lst_export_cols.selectedItems()]
@@ -304,6 +669,10 @@ class DataTab(QWidget):
             self._log(f"Exported {len(cols)} columns → {path}")
         except Exception as e:
             QMessageBox.critical(self, "Export error", str(e))
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _log(self, msg: str):
         self.log.append(msg)
