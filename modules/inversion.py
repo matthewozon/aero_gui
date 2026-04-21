@@ -223,12 +223,269 @@ class EMInversion(InversionMethod):
 
 
 # ============================================================
+#  AeroInv helpers
+# ============================================================
+
+def _build_J(n_model: int, scale: float = 1e-3) -> np.ndarray:
+    """
+    Square second-order finite-difference regularisation operator,
+    matching the construction used inside aeroinv_reg.
+    Shape (n_model, n_model); boundary rows zeroed.
+    """
+    J = scale * (
+        np.diag(-2.0 * np.ones(n_model))
+        + np.diag(np.ones(n_model - 1), k=1)
+        + np.diag(np.ones(n_model - 1), k=-1)
+    )
+    J[0, :2] = 0.0
+    J[-1, -2:] = 0.0
+    return J
+
+
+def _build_W(K: np.ndarray) -> np.ndarray:
+    """Data-driven diagonal preconditioner (column sums of K, normalised)."""
+    W = K.sum(axis=1)
+    W = np.where(W > 0, 1.0 / W, 0.0)
+    total = W.sum()
+    if total > 0:
+        W = K.shape[0] * W / total
+    return W
+
+
+# ============================================================
+#  Method 5 – AeroInv quick estimate
+# ============================================================
+
+class AeroInvQuick(InversionMethod):
+    """
+    Non-iterative rough estimate.  For each measurement channel, the
+    effective diameter range where sensitivity ≥50% of peak is found
+    and the counts are divided by that width.  Fast sanity-check only;
+    may return small negative values (clipped to zero).
+    """
+
+    name = "Quick estimate (AeroInv)"
+
+    def solve(self, A: np.ndarray, counts: np.ndarray,
+              dp_grid: np.ndarray) -> InversionResult:
+        from modules.aeroinv import aeroinv_quick
+        # aeroinv_quick returns a (n_channels,) estimate at each channel's
+        # effective diameter; interpolate back to dp_grid.
+        N_ch = aeroinv_quick(A, dp_grid, counts)   # (n_channels,)
+        N_ch = np.maximum(np.asarray(N_ch, dtype=float), 0.0)
+        # Centre diameter for each channel ≈ argmax of each kernel row
+        ch_dp = dp_grid[np.argmax(A, axis=1)]
+        order = np.argsort(ch_dp)
+        N = np.interp(dp_grid, ch_dp[order], N_ch[order])
+        residual = np.linalg.norm(A @ N - counts) / (np.linalg.norm(counts) + 1e-30)
+        return InversionResult(N_retrieved=N, dp_grid=dp_grid,
+                               residual=residual, info={})
+
+
+# ============================================================
+#  Method 6 – AeroInv preconditioned regularised (closed-form)
+# ============================================================
+
+class AeroInvPrecondReg(InversionMethod):
+    """
+    Closed-form preconditioned regularised inversion.  Solves the normal
+    equation ``(EK'EK + J'J) n = EK' En`` where E is a channel-wise
+    preconditioner and J is a second-order smoothness prior.  No
+    positivity constraint; clipped to zero after solve.
+    """
+
+    name = "Precond. regularised (AeroInv)"
+
+    def __init__(self, u0: float = 10000.0, rel_un: float = 0.1):
+        """
+        Parameters
+        ----------
+        u0     : characteristic density scale
+        rel_un : relative amplitude of model uncertainty in (0, 1)
+        """
+        self.u0 = u0
+        self.rel_un = rel_un
+
+    def solve(self, A: np.ndarray, counts: np.ndarray,
+              dp_grid: np.ndarray) -> InversionResult:
+        from modules.aeroinv import precond_reg_inv
+        N = precond_reg_inv(A, counts, u0=self.u0, rel_un=self.rel_un)
+        N = np.maximum(np.asarray(N, dtype=float), 0.0)
+        residual = np.linalg.norm(A @ N - counts) / (np.linalg.norm(counts) + 1e-30)
+        return InversionResult(N_retrieved=N, dp_grid=dp_grid,
+                               residual=residual,
+                               info={"u0": self.u0, "rel_un": self.rel_un})
+
+
+# ============================================================
+#  Method 7 – AeroInv Chambolle-Pock (Gaussian noise, positivity)
+# ============================================================
+
+class AeroInvRegCP(InversionMethod):
+    """
+    Chambolle-Pock Algorithm 2 with Gaussian-noise fidelity and positivity
+    constraint.  Warm-starts consecutive scans.  Use ``solve_series`` when
+    inverting multiple scans for efficiency.
+    """
+
+    name = "Chambolle-Pock / Gaussian (AeroInv)"
+
+    def __init__(self, tau00: float = 1e15, Niter: int = 1000):
+        """
+        Parameters
+        ----------
+        tau00 : initial primal step size
+        Niter : Chambolle-Pock iterations per scan
+        """
+        self.tau00 = tau00
+        self.Niter = Niter
+
+    def solve(self, A: np.ndarray, counts: np.ndarray,
+              dp_grid: np.ndarray) -> InversionResult:
+        from modules.aeroinv import aeroinv_reg
+        y2d = counts[:, np.newaxis]          # (n_data, 1)
+        F_ALL, _ = aeroinv_reg(y2d, A, tau00=self.tau00, Niter=self.Niter)
+        N = F_ALL[0]
+        residual = np.linalg.norm(A @ N - counts) / (np.linalg.norm(counts) + 1e-30)
+        return InversionResult(N_retrieved=N, dp_grid=dp_grid,
+                               residual=residual,
+                               info={"tau00": self.tau00, "Niter": self.Niter})
+
+    def solve_series(self, A: np.ndarray, count_matrix: np.ndarray,
+                     dp_grid: np.ndarray) -> np.ndarray:
+        """
+        Invert all scans at once, warm-starting each from the previous.
+
+        Parameters
+        ----------
+        count_matrix : shape (n_scans, n_channels)
+
+        Returns
+        -------
+        ndarray, shape (n_scans, n_dp_model)
+        """
+        from modules.aeroinv import aeroinv_reg
+        # aeroinv_reg expects y shape (n_data, Nt)
+        y = count_matrix.T                   # (n_channels, n_scans)
+        F_ALL, _ = aeroinv_reg(y, A, tau00=self.tau00, Niter=self.Niter)
+        return F_ALL                         # (n_scans, n_dp_model)
+
+
+# ============================================================
+#  Method 8 – AeroInv Chambolle-Pock (Poisson noise, positivity)
+# ============================================================
+
+class AeroInvCPPoisson(InversionMethod):
+    """
+    Chambolle-Pock Algorithm 2 with exact Poisson-noise proximal operators
+    and positivity constraint.  Suitable for low-count raw data.
+    """
+
+    name = "Chambolle-Pock / Poisson (AeroInv)"
+
+    def __init__(self, tau0: float = 1.0, Niter: int = 500,
+                 r_n_tol: float = 1e-6, r_y_tol: float = 0.5,
+                 reg_scale: float = 1e-3):
+        """
+        Parameters
+        ----------
+        tau0      : initial primal step size
+        Niter     : maximum iterations
+        r_n_tol   : relative-step stopping tolerance
+        r_y_tol   : median data-residual stopping tolerance
+        reg_scale : second-order regularisation strength
+        """
+        self.tau0 = tau0
+        self.Niter = Niter
+        self.r_n_tol = r_n_tol
+        self.r_y_tol = r_y_tol
+        self.reg_scale = reg_scale
+
+    def solve(self, A: np.ndarray, counts: np.ndarray,
+              dp_grid: np.ndarray) -> InversionResult:
+        from modules.aeroinv import alg2_cp_poisson
+        n = A.shape[1]
+        J = _build_J(n, scale=self.reg_scale)
+        W = _build_W(A)
+        A_stacked = np.vstack([np.diag(W) @ A, J])
+        W_stop = np.ones(n)
+        x0 = np.full(n, max(float(counts.mean()), 1.0))
+        xn, _, _, _, _, _, N_last = alg2_cp_poisson(
+            x0, counts, A_stacked, W, W_stop,
+            tau0=self.tau0, Niter=self.Niter,
+            r_n_tol=self.r_n_tol, r_y_tol=self.r_y_tol,
+        )
+        N = np.maximum(xn, 0.0)
+        residual = np.linalg.norm(A @ N - counts) / (np.linalg.norm(counts) + 1e-30)
+        return InversionResult(N_retrieved=N, dp_grid=dp_grid,
+                               residual=residual,
+                               info={"iterations": int(N_last),
+                                     "tau0": self.tau0,
+                                     "reg_scale": self.reg_scale})
+
+
+# ============================================================
+#  Method 9 – AeroInv Newton + Chambolle-Pock (Poisson, Ozon 2020)
+# ============================================================
+
+class AeroInvOzon2020(InversionMethod):
+    """
+    Newton-like outer loop with a Chambolle-Pock inner solver for Poisson
+    noise (Ozon et al. 2020).  Uses a diagonal Hessian approximation and
+    backtracking line search.  Best for raw photon/particle count data.
+    """
+
+    name = "Newton-CP / Poisson – Ozon 2020 (AeroInv)"
+
+    def __init__(self, beta_f: float = 1e-5, max_iter: int = 5000,
+                 N_max: int = 50, reg_scale: float = 1e-3):
+        """
+        Parameters
+        ----------
+        beta_f    : log-floor to prevent log(0)
+        max_iter  : maximum inner Chambolle-Pock iterations per outer step
+        N_max     : maximum outer Newton iterations
+        reg_scale : second-order regularisation strength
+        """
+        self.beta_f = beta_f
+        self.max_iter = max_iter
+        self.N_max = N_max
+        self.reg_scale = reg_scale
+
+    def solve(self, A: np.ndarray, counts: np.ndarray,
+              dp_grid: np.ndarray) -> InversionResult:
+        from modules.aeroinv import ozon2020
+        n = A.shape[1]
+        J = _build_J(n, scale=self.reg_scale)
+        W = _build_W(A)
+        f0 = np.full(n, max(float(counts.mean()), 1.0))
+        N = ozon2020(
+            f0, counts, A, J, W,
+            beta_f=self.beta_f,
+            max_iter=self.max_iter,
+            N_max=self.N_max,
+        )
+        N = np.maximum(N, 0.0)
+        residual = np.linalg.norm(A @ N - counts) / (np.linalg.norm(counts) + 1e-30)
+        return InversionResult(N_retrieved=N, dp_grid=dp_grid,
+                               residual=residual,
+                               info={"beta_f": self.beta_f,
+                                     "N_max": self.N_max,
+                                     "reg_scale": self.reg_scale})
+
+
+# ============================================================
 #  Registry  – used by the GUI to populate the combo-box
 # ============================================================
 
 INVERSION_METHODS = {
-    TikhonovInversion.name: TikhonovInversion,
+    TikhonovInversion.name:     TikhonovInversion,
     TruncatedSVDInversion.name: TruncatedSVDInversion,
-    NNLSInversion.name: NNLSInversion,
-    EMInversion.name: EMInversion,
+    NNLSInversion.name:         NNLSInversion,
+    EMInversion.name:           EMInversion,
+    AeroInvQuick.name:          AeroInvQuick,
+    AeroInvPrecondReg.name:     AeroInvPrecondReg,
+    AeroInvRegCP.name:          AeroInvRegCP,
+    AeroInvCPPoisson.name:      AeroInvCPPoisson,
+    AeroInvOzon2020.name:       AeroInvOzon2020,
 }
