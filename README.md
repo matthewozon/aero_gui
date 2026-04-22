@@ -32,6 +32,8 @@ cd aero_gui
 uv sync
 ```
 
+blabla I am on my new branch
+
 ### 3. Run the application
 
 ```bash
