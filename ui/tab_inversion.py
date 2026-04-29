@@ -34,7 +34,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QComboBox, QLabel, QFileDialog,
     QGroupBox, QDoubleSpinBox, QSpinBox, QSplitter,
     QTextEdit, QMessageBox, QCheckBox, QTabWidget,
-    QFrame,
+    QFrame, QSizePolicy, QScrollArea,
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor
@@ -119,7 +119,6 @@ class InversionTab(QWidget):
         root = QHBoxLayout(self)
 
         left_w = QWidget()
-        left_w.setFixedWidth(310)
         left = QVBoxLayout(left_w)
         left.setSpacing(8)
 
@@ -191,12 +190,21 @@ class InversionTab(QWidget):
         right = QVBoxLayout(right_w)
         self.fig = Figure(figsize=(9, 6), facecolor="#1e1e2e")
         self.canvas = FigureCanvas(self.fig)
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.setMinimumSize(100, 100)
         self.toolbar = NavigationToolbar(self.canvas, self)
         right.addWidget(self.toolbar)
         right.addWidget(self.canvas)
 
+        scroll_left = QScrollArea()
+        scroll_left.setWidget(left_w)
+        scroll_left.setWidgetResizable(True)
+        scroll_left.setFixedWidth(326)
+        scroll_left.setFrameShape(QFrame.NoFrame)
+        scroll_left.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_w)
+        splitter.addWidget(scroll_left)
         splitter.addWidget(right_w)
         splitter.setStretchFactor(1, 3)
         root.addWidget(splitter)

@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QComboBox, QLabel, QFileDialog,
     QGroupBox, QDoubleSpinBox, QSpinBox, QSplitter,
     QTextEdit, QMessageBox, QCheckBox, QTabWidget,
-    QScrollArea, QFrame
+    QScrollArea, QFrame, QSizePolicy,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
@@ -127,11 +127,13 @@ class GDEDirectWorker(QThread):
 
         # ── deposition profile ─────────────────────────────────────────
         xi_static = None
+        wd_rate_s = None           # [1/s] per bin, for plotting
         if ws.is_los:
             wd_rate = wall_deposition_rate(ws)    # [1/s]
             gamma_c = max(float(np.mean(wd_rate)), 1e-30)
             ws.gamma0 = gamma_c
             xi_static = wd_rate / gamma_c         # dimensionless (0-1)
+            wd_rate_s = wd_rate
 
         # ── time axis ──────────────────────────────────────────────────
         n_t = max(2, int(round(p['t_end'] / max(p['dt_out'], 1.0))) + 1)
@@ -141,6 +143,7 @@ class GDEDirectWorker(QThread):
                 if xi_static is not None else None)
 
         # ── condensation / Kelvin growth rate ──────────────────────────
+        GR_nm_h = None             # (nbin, n_t) [nm/h], for plotting
         if ws.is_con:
             if p['kelvin']:
                 Rg    = 8.3144598               # J/(mol·K)
@@ -155,12 +158,15 @@ class GDEDirectWorker(QThread):
                 zeta_per_bin = GR_phys / GR_c               # dimensionless
                 # Tile to (nbin, n_t) so simulate() sees per-bin profile
                 zeta_t = np.tile(zeta_per_bin[:, None], (1, n_t))
+                GR_nm_h = np.tile((GR_phys * 1e9 * 3600)[:, None], (1, n_t))
             else:
                 zeta_t = 1.0   # scalar: use full GR_c uniformly
+                GR_nm_h = np.full((p['n_bins'], n_t), GR_base_ms * 1e9 * 3600)
         else:
             zeta_t = 0.0
 
         # ── nucleation profile ─────────────────────────────────────────
+        J_cm3_s = None             # (n_t,) [#/cm³/s], for plotting
         if ws.is_nuc:
             if p['nuc_profile'] == 'gaussian':
                 t_peak  = p['nuc_peak_min'] * 60.0
@@ -168,6 +174,8 @@ class GDEDirectWorker(QThread):
                 j_t = np.exp(-0.5 * ((t_samp - t_peak) / t_width) ** 2)
             else:
                 j_t = 1.0   # constant, scaled by J_c
+            j_t_arr = np.full(n_t, j_t) if np.isscalar(j_t) else j_t
+            J_cm3_s = J_phys_m3 * j_t_arr * 1e-6   # [#/cm³/s]
         else:
             j_t = 0.0
 
@@ -183,9 +191,12 @@ class GDEDirectWorker(QThread):
         N_cm3 = X * x_c * 1e-6   # [#/cm³]
 
         self.finished.emit({
-            'times':  t_samp,
-            'dp_nm':  dp_m * 1e9,
-            'N':      N_cm3,       # (nbin, n_t)
+            'times':    t_samp,
+            'dp_nm':    dp_m * 1e9,
+            'N':        N_cm3,        # (nbin, n_t)
+            'wd_rate':  wd_rate_s,    # (nbin,) [1/s] or None
+            'GR_nm_h':  GR_nm_h,     # (nbin, n_t) [nm/h] or None
+            'J_cm3_s':  J_cm3_s,     # (n_t,) [#/cm³/s] or None
         })
 
 
@@ -376,6 +387,10 @@ class SimulationTab(QWidget):
         il.addWidget(self.spn_sg, 2, 1)
         left.addWidget(grp_init)
 
+        self.btn_kernel = QPushButton("Plot Coagulation Kernel")
+        self.btn_kernel.clicked.connect(self._plot_coag_kernel)
+        left.addWidget(self.btn_kernel)
+
         self.btn_run = QPushButton("▶  Run Simulation")
         self.btn_run.clicked.connect(self._run_sim)
         left.addWidget(self.btn_run)
@@ -397,6 +412,8 @@ class SimulationTab(QWidget):
 
         self.fig_heat = Figure(figsize=(9, 5), facecolor="#1e1e2e")
         self.canvas_heat = FigureCanvas(self.fig_heat)
+        self.canvas_heat.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas_heat.setMinimumSize(100, 100)
         self.tb_heat = NavigationToolbar(self.canvas_heat, self)
         hw = QWidget(); hl = QVBoxLayout(hw)
         hl.addWidget(self.tb_heat); hl.addWidget(self.canvas_heat)
@@ -404,10 +421,48 @@ class SimulationTab(QWidget):
 
         self.fig_N = Figure(figsize=(9, 4), facecolor="#1e1e2e")
         self.canvas_N = FigureCanvas(self.fig_N)
+        self.canvas_N.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas_N.setMinimumSize(100, 100)
         self.tb_N = NavigationToolbar(self.canvas_N, self)
         nw = QWidget(); nl3 = QVBoxLayout(nw)
         nl3.addWidget(self.tb_N); nl3.addWidget(self.canvas_N)
         self.plot_tabs.addTab(nw, "Total N(t)")
+
+        self.fig_coag = Figure(figsize=(9, 5), facecolor="#1e1e2e")
+        self.canvas_coag = FigureCanvas(self.fig_coag)
+        self.canvas_coag.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas_coag.setMinimumSize(100, 100)
+        self.tb_coag = NavigationToolbar(self.canvas_coag, self)
+        coag_w = QWidget(); coag_l = QVBoxLayout(coag_w)
+        coag_l.addWidget(self.tb_coag); coag_l.addWidget(self.canvas_coag)
+        self.plot_tabs.addTab(coag_w, "Coagulation Kernel")
+
+        self.fig_wd = Figure(figsize=(9, 4), facecolor="#1e1e2e")
+        self.canvas_wd = FigureCanvas(self.fig_wd)
+        self.canvas_wd.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas_wd.setMinimumSize(100, 100)
+        self.tb_wd = NavigationToolbar(self.canvas_wd, self)
+        wd_w = QWidget(); wd_l = QVBoxLayout(wd_w)
+        wd_l.addWidget(self.tb_wd); wd_l.addWidget(self.canvas_wd)
+        self.plot_tabs.addTab(wd_w, "Wall Loss Rate")
+
+        self.fig_gr = Figure(figsize=(9, 5), facecolor="#1e1e2e")
+        self.canvas_gr = FigureCanvas(self.fig_gr)
+        self.canvas_gr.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas_gr.setMinimumSize(100, 100)
+        self.tb_gr = NavigationToolbar(self.canvas_gr, self)
+        gr_w = QWidget(); gr_l = QVBoxLayout(gr_w)
+        gr_l.addWidget(self.tb_gr); gr_l.addWidget(self.canvas_gr)
+        self.plot_tabs.addTab(gr_w, "Growth Rate")
+
+        self.fig_nuc = Figure(figsize=(9, 4), facecolor="#1e1e2e")
+        self.canvas_nuc = FigureCanvas(self.fig_nuc)
+        self.canvas_nuc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas_nuc.setMinimumSize(100, 100)
+        self.tb_nuc = NavigationToolbar(self.canvas_nuc, self)
+        nuc_w = QWidget(); nuc_l = QVBoxLayout(nuc_w)
+        nuc_l.addWidget(self.tb_nuc); nuc_l.addWidget(self.canvas_nuc)
+        self.plot_tabs.addTab(nuc_w, "Nucleation Rate")
 
         right.addWidget(self.plot_tabs)
 
@@ -476,9 +531,12 @@ class SimulationTab(QWidget):
         )
         times, dp_grid, N = sim.get_heatmap_data()
         self._gde_result = {
-            'times': times,
-            'dp_nm': dp_grid,
-            'N':     N.T,        # (nbin, n_t) to match direct GDE output
+            'times':   times,
+            'dp_nm':   dp_grid,
+            'N':       N.T,      # (nbin, n_t) to match direct GDE output
+            'wd_rate': None,
+            'GR_nm_h': None,
+            'J_cm3_s': None,
         }
         self._plot_results()
         if self.main_window:
@@ -543,6 +601,132 @@ class SimulationTab(QWidget):
 
     # ── plotting ───────────────────────────────────────────────────────
 
+    def _plot_coag_kernel(self):
+        from modules.algo.gde import AeroSys, coagulation_coefficient
+        import matplotlib.colors as mcolors
+
+        dp_m = np.logspace(
+            np.log10(self.spn_dpmin.value() * 1e-9),
+            np.log10(self.spn_dpmax.value() * 1e-9),
+            self.spn_nbins.value(),
+        )
+        dp_nm = dp_m * 1e9
+
+        ws = AeroSys.from_diameters(
+            dp_m, beta_c=1e-15, GR_c=1e-9, J_c=1.0,
+            gamma_c=1.0, t_c=3600.0, x_c=1e10,
+        )
+        coagulation_coefficient(ws,
+                                temperature=self.spn_T.value(),
+                                pressure=self.spn_P.value(),
+                                density=self.spn_rho.value())
+
+        beta_phys = ws.beta * ws.beta0 * 1e6   # m³/s → cm³/s
+
+        self.fig_coag.clear()
+        ax = self.fig_coag.add_subplot(111)
+        ax.set_facecolor("#181825")
+
+        norm = mcolors.LogNorm(vmin=beta_phys.min(), vmax=beta_phys.max())
+        im = ax.pcolormesh(dp_nm, dp_nm, beta_phys,
+                           norm=norm, cmap="viridis", shading="auto")
+
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+
+        cb = self.fig_coag.colorbar(im, ax=ax)
+        cb.ax.tick_params(colors="#cdd6f4")
+        cb.set_label("β(Dₚᵢ, Dₚⱼ) [cm³/s]", color="#cdd6f4")
+
+        ax.set_xlabel("Dₚ (nm)", color="#cdd6f4")
+        ax.set_ylabel("Dₚ (nm)", color="#cdd6f4")
+        ax.set_title(
+            f"Coagulation Kernel  (T={self.spn_T.value():.0f} K, "
+            f"P={self.spn_P.value():.0f} Pa, "
+            f"ρ={self.spn_rho.value():.0f} kg/m³)",
+            color="#cdd6f4",
+        )
+        ax.tick_params(colors="#cdd6f4")
+        for s in ax.spines.values():
+            s.set_edgecolor("#45475a")
+
+        self.fig_coag.tight_layout()
+        self.canvas_coag.draw()
+        self.plot_tabs.setCurrentIndex(2)
+        self._log("Coagulation kernel plotted.")
+
+    def _plot_physics(self):
+        """Plot wall loss rate, growth rate heatmap, and nucleation rate."""
+        r     = self._gde_result
+        dp_nm = r['dp_nm']
+        times = r['times']
+        t_min = times / 60.0
+
+        # ── Wall loss rate ─────────────────────────────────────────────
+        self.fig_wd.clear()
+        ax = self.fig_wd.add_subplot(111)
+        ax.set_facecolor("#181825")
+        if r['wd_rate'] is not None:
+            ax.plot(dp_nm, r['wd_rate'], color="#89b4fa", linewidth=2)
+            ax.fill_between(dp_nm, r['wd_rate'], alpha=0.15, color="#89b4fa")
+            ax.set_xscale("log")
+            ax.set_xlabel("Dₚ (nm)", color="#cdd6f4")
+            ax.set_ylabel("Wall loss rate [s⁻¹]", color="#cdd6f4")
+            ax.set_title("Wall Deposition Rate Profile", color="#cdd6f4")
+        else:
+            ax.text(0.5, 0.5, "Wall deposition not enabled",
+                    ha="center", va="center", color="#6c7086",
+                    transform=ax.transAxes)
+        ax.tick_params(colors="#cdd6f4")
+        for s in ax.spines.values():
+            s.set_edgecolor("#45475a")
+        self.fig_wd.tight_layout()
+        self.canvas_wd.draw()
+
+        # ── Growth rate heatmap ────────────────────────────────────────
+        self.fig_gr.clear()
+        ax = self.fig_gr.add_subplot(111)
+        ax.set_facecolor("#181825")
+        if r['GR_nm_h'] is not None:
+            im = ax.pcolormesh(t_min, dp_nm, r['GR_nm_h'],
+                               cmap="inferno", shading="auto")
+            ax.set_yscale("log")
+            cb = self.fig_gr.colorbar(im, ax=ax)
+            cb.ax.tick_params(colors="#cdd6f4")
+            cb.set_label("Growth rate [nm/h]", color="#cdd6f4")
+            ax.set_xlabel("Time (min)", color="#cdd6f4")
+            ax.set_ylabel("Dₚ (nm)", color="#cdd6f4")
+            ax.set_title("Growth Rate", color="#cdd6f4")
+        else:
+            ax.text(0.5, 0.5, "Condensation not enabled",
+                    ha="center", va="center", color="#6c7086",
+                    transform=ax.transAxes)
+        ax.tick_params(colors="#cdd6f4")
+        for s in ax.spines.values():
+            s.set_edgecolor("#45475a")
+        self.fig_gr.tight_layout()
+        self.canvas_gr.draw()
+
+        # ── Nucleation rate vs time ────────────────────────────────────
+        self.fig_nuc.clear()
+        ax = self.fig_nuc.add_subplot(111)
+        ax.set_facecolor("#181825")
+        if r['J_cm3_s'] is not None:
+            ax.plot(t_min, r['J_cm3_s'], color="#a6e3a1", linewidth=2)
+            ax.fill_between(t_min, r['J_cm3_s'], alpha=0.15, color="#a6e3a1")
+            ax.set_xlabel("Time (min)", color="#cdd6f4")
+            ax.set_ylabel("J [#/cm³/s]", color="#cdd6f4")
+            ax.set_title("Nucleation Rate vs. Time", color="#cdd6f4")
+        else:
+            ax.text(0.5, 0.5, "Nucleation not enabled",
+                    ha="center", va="center", color="#6c7086",
+                    transform=ax.transAxes)
+        ax.tick_params(colors="#cdd6f4")
+        for s in ax.spines.values():
+            s.set_edgecolor("#45475a")
+        self.fig_nuc.tight_layout()
+        self.canvas_nuc.draw()
+
     def _plot_results(self):
         if self._gde_result is None:
             return
@@ -586,6 +770,10 @@ class SimulationTab(QWidget):
             s.set_edgecolor("#45475a")
         self.fig_N.tight_layout()
         self.canvas_N.draw()
+
+        if self.chk_coag.isChecked():
+            self._plot_coag_kernel()
+        self._plot_physics()
 
     # ── save ───────────────────────────────────────────────────────────
 

@@ -24,7 +24,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QComboBox, QLabel, QFileDialog,
     QGroupBox, QDoubleSpinBox, QSpinBox, QSplitter,
     QTextEdit, QMessageBox, QCheckBox, QTabWidget,
-    QProgressBar
+    QProgressBar, QSizePolicy, QScrollArea, QFrame,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
@@ -98,7 +98,7 @@ class EstimationTab(QWidget):
     def _build_ui(self):
         root = QHBoxLayout(self)
 
-        left_w = QWidget(); left_w.setFixedWidth(320)
+        left_w = QWidget()
         left   = QVBoxLayout(left_w); left.setSpacing(8)
 
         # ── Method selector ─────────────────────────────────────────
@@ -208,6 +208,8 @@ class EstimationTab(QWidget):
         ]:
             fig    = Figure(figsize=(9, 4), facecolor="#1e1e2e")
             canvas = FigureCanvas(fig)
+            canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            canvas.setMinimumSize(100, 100)
             tb     = NavigationToolbar(canvas, self)
             w = QWidget(); lyt = QVBoxLayout(w)
             lyt.addWidget(tb); lyt.addWidget(canvas)
@@ -218,8 +220,15 @@ class EstimationTab(QWidget):
 
         right.addWidget(self.plot_tabs)
 
+        scroll_left = QScrollArea()
+        scroll_left.setWidget(left_w)
+        scroll_left.setWidgetResizable(True)
+        scroll_left.setFixedWidth(336)
+        scroll_left.setFrameShape(QFrame.NoFrame)
+        scroll_left.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_w)
+        splitter.addWidget(scroll_left)
         splitter.addWidget(right_w)
         splitter.setStretchFactor(1, 3)
         root.addWidget(splitter)

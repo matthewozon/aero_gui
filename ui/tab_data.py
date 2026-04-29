@@ -24,7 +24,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QComboBox, QLabel, QFileDialog,
     QGroupBox, QCheckBox, QDoubleSpinBox,
     QSplitter, QListWidget, QTextEdit,
-    QTabWidget, QMessageBox, QAbstractItemView,
+    QTabWidget, QMessageBox, QAbstractItemView, QSizePolicy, QScrollArea, QFrame,
 )
 from PyQt5.QtCore import Qt
 
@@ -57,7 +57,6 @@ class DataTab(QWidget):
         left.setSpacing(8)
         left_w = QWidget()
         left_w.setLayout(left)
-        left_w.setFixedWidth(290)
 
         # ── File format selector ──────────────────────────────────────
         grp_fmt = QGroupBox("File Format")
@@ -205,6 +204,8 @@ class DataTab(QWidget):
         # Heatmap figure
         self.fig_heat = Figure(figsize=(9, 5), facecolor="#1e1e2e")
         self.canvas_heat = FigureCanvas(self.fig_heat)
+        self.canvas_heat.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas_heat.setMinimumSize(100, 100)
         self.toolbar_heat = NavigationToolbar(self.canvas_heat, self)
         heat_w = QWidget()
         heat_l = QVBoxLayout(heat_w)
@@ -215,6 +216,8 @@ class DataTab(QWidget):
         # Time series figure
         self.fig_ts = Figure(figsize=(9, 4), facecolor="#1e1e2e")
         self.canvas_ts = FigureCanvas(self.fig_ts)
+        self.canvas_ts.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas_ts.setMinimumSize(100, 100)
         self.toolbar_ts = NavigationToolbar(self.canvas_ts, self)
         ts_w = QWidget()
         ts_l = QVBoxLayout(ts_w)
@@ -232,8 +235,15 @@ class DataTab(QWidget):
         right.addWidget(self.log)
 
         # Combine
+        scroll_left = QScrollArea()
+        scroll_left.setWidget(left_w)
+        scroll_left.setWidgetResizable(True)
+        scroll_left.setFixedWidth(306)
+        scroll_left.setFrameShape(QFrame.NoFrame)
+        scroll_left.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_w)
+        splitter.addWidget(scroll_left)
         splitter.addWidget(right_w)
         splitter.setStretchFactor(1, 3)
 

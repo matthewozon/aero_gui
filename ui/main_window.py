@@ -6,10 +6,10 @@ Top-level application window.  Hosts a QTabWidget with one tab per module.
 
 from PyQt5.QtWidgets import (
     QMainWindow, QTabWidget, QStatusBar,
-    QAction, QFileDialog, QMessageBox, QWidget
+    QAction, QFileDialog, QMessageBox, QWidget, QApplication
 )
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QIcon
+from PyQt5.QtGui import QIcon, QFont
 
 from modules.data_model import AerosolDataset
 
@@ -24,7 +24,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AeroGUI – Atmospheric Particle Analysis")
-        self.resize(1280, 860)
+        self._scale = 1.0
+
+        screen = QApplication.desktop().availableGeometry()
+        self.resize(min(1280, screen.width() - 40), min(860, screen.height() - 60))
 
         # Shared dataset (passed by reference to all tabs)
         self.dataset = AerosolDataset()
@@ -77,6 +80,24 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
+        # View menu
+        view_menu = menubar.addMenu("View")
+
+        zoom_in_action = QAction("Zoom In", self)
+        zoom_in_action.setShortcut("Ctrl+=")
+        zoom_in_action.triggered.connect(self._zoom_in)
+        view_menu.addAction(zoom_in_action)
+
+        zoom_out_action = QAction("Zoom Out", self)
+        zoom_out_action.setShortcut("Ctrl+-")
+        zoom_out_action.triggered.connect(self._zoom_out)
+        view_menu.addAction(zoom_out_action)
+
+        zoom_reset_action = QAction("Reset Zoom", self)
+        zoom_reset_action.setShortcut("Ctrl+0")
+        zoom_reset_action.triggered.connect(self._zoom_reset)
+        view_menu.addAction(zoom_reset_action)
+
         # Help menu
         help_menu = menubar.addMenu("Help")
         about_action = QAction("About AeroGUI", self)
@@ -84,127 +105,148 @@ class MainWindow(QMainWindow):
         help_menu.addAction(about_action)
 
     def _apply_stylesheet(self):
-        self.setStyleSheet("""
-            QMainWindow {
+        s = self._scale
+        f_base  = round(12 * s)
+        f_small = round(11 * s)
+        f_tab   = round(13 * s)
+
+        font = QApplication.font()
+        font.setPointSizeF(10 * s)
+        QApplication.setFont(font)
+
+        self.setStyleSheet(f"""
+            QMainWindow {{
                 background-color: #1e1e2e;
-            }
-            QTabWidget::pane {
+            }}
+            QTabWidget::pane {{
                 border: 1px solid #45475a;
                 background-color: #1e1e2e;
-            }
-            QTabBar::tab {
+            }}
+            QTabBar::tab {{
                 background: #313244;
                 color: #cdd6f4;
-                padding: 8px 18px;
+                padding: {round(8*s)}px {round(18*s)}px;
                 margin-right: 2px;
                 border-top-left-radius: 6px;
                 border-top-right-radius: 6px;
-                font-size: 13px;
-            }
-            QTabBar::tab:selected {
+                font-size: {f_tab}px;
+            }}
+            QTabBar::tab:selected {{
                 background: #89b4fa;
                 color: #1e1e2e;
                 font-weight: bold;
-            }
-            QTabBar::tab:hover:!selected {
+            }}
+            QTabBar::tab:hover:!selected {{
                 background: #45475a;
-            }
-            QGroupBox {
+            }}
+            QGroupBox {{
                 color: #cdd6f4;
                 border: 1px solid #45475a;
                 border-radius: 6px;
                 margin-top: 10px;
                 padding-top: 10px;
-                font-size: 12px;
+                font-size: {f_base}px;
                 font-weight: bold;
-            }
-            QGroupBox::title {
+            }}
+            QGroupBox::title {{
                 subcontrol-origin: margin;
                 left: 10px;
                 color: #89b4fa;
-            }
-            QLabel {
+            }}
+            QLabel {{
                 color: #cdd6f4;
-                font-size: 12px;
-            }
-            QPushButton {
+                font-size: {f_base}px;
+            }}
+            QPushButton {{
                 background-color: #45475a;
                 color: #cdd6f4;
                 border: 1px solid #585b70;
                 border-radius: 5px;
-                padding: 6px 14px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
+                padding: {round(6*s)}px {round(14*s)}px;
+                font-size: {f_base}px;
+            }}
+            QPushButton:hover {{
                 background-color: #585b70;
-            }
-            QPushButton:pressed {
+            }}
+            QPushButton:pressed {{
                 background-color: #89b4fa;
                 color: #1e1e2e;
-            }
-            QPushButton:disabled {
+            }}
+            QPushButton:disabled {{
                 background-color: #313244;
                 color: #6c7086;
-            }
-            QComboBox {
+            }}
+            QComboBox {{
                 background-color: #313244;
                 color: #cdd6f4;
                 border: 1px solid #45475a;
                 border-radius: 4px;
                 padding: 4px 8px;
-                font-size: 12px;
-            }
-            QComboBox::drop-down {
+                font-size: {f_base}px;
+            }}
+            QComboBox::drop-down {{
                 border: none;
-            }
-            QComboBox QAbstractItemView {
+            }}
+            QComboBox QAbstractItemView {{
                 background-color: #313244;
                 color: #cdd6f4;
                 selection-background-color: #89b4fa;
                 selection-color: #1e1e2e;
-            }
-            QLineEdit, QSpinBox, QDoubleSpinBox {
+            }}
+            QLineEdit, QSpinBox, QDoubleSpinBox {{
                 background-color: #313244;
                 color: #cdd6f4;
                 border: 1px solid #45475a;
                 border-radius: 4px;
                 padding: 4px 8px;
-                font-size: 12px;
-            }
-            QCheckBox {
+                font-size: {f_base}px;
+            }}
+            QCheckBox {{
                 color: #cdd6f4;
-                font-size: 12px;
-            }
-            QCheckBox::indicator:checked {
+                font-size: {f_base}px;
+            }}
+            QCheckBox::indicator:checked {{
                 background-color: #89b4fa;
                 border: 1px solid #89b4fa;
-            }
-            QTextEdit {
+            }}
+            QTextEdit {{
                 background-color: #181825;
                 color: #a6e3a1;
                 border: 1px solid #45475a;
                 border-radius: 4px;
                 font-family: monospace;
-                font-size: 11px;
-            }
-            QStatusBar {
+                font-size: {f_small}px;
+            }}
+            QStatusBar {{
                 background-color: #181825;
                 color: #a6e3a1;
-                font-size: 11px;
-            }
-            QScrollBar:vertical {
+                font-size: {f_small}px;
+            }}
+            QScrollBar:vertical {{
                 background: #1e1e2e;
                 width: 10px;
-            }
-            QScrollBar::handle:vertical {
+            }}
+            QScrollBar::handle:vertical {{
                 background: #45475a;
                 border-radius: 4px;
-            }
+            }}
         """)
 
     # ------------------------------------------------------------------
     # Slots
     # ------------------------------------------------------------------
+
+    def _zoom_in(self):
+        self._scale = min(2.0, round(self._scale + 0.1, 1))
+        self._apply_stylesheet()
+
+    def _zoom_out(self):
+        self._scale = max(0.5, round(self._scale - 0.1, 1))
+        self._apply_stylesheet()
+
+    def _zoom_reset(self):
+        self._scale = 1.0
+        self._apply_stylesheet()
 
     def set_status(self, msg: str):
         self.status.showMessage(msg)
