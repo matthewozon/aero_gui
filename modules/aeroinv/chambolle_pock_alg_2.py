@@ -149,6 +149,7 @@ def aeroinv_reg(
     K: np.ndarray,
     tau00: float = 1.0e15,
     Niter: int = 1000,
+    reg_scale: float = 1.0,
 ):
     """Regularised inversion with a positivity constraint (Gaussian noise).
 
@@ -166,6 +167,9 @@ def aeroinv_reg(
         Initial primal step size (default 1e15).
     Niter : int, optional
         Number of Chambolle-Pock iterations per time step (default 1000).
+    reg_scale : float, optional
+        Multiplicative weight on the second-order finite-difference
+        regularisation operator J (default 1.0).
 
     Returns
     -------
@@ -187,7 +191,7 @@ def aeroinv_reg(
         )
 
     # Second-order finite-difference regularisation operator
-    J = 1.0e-3 * (
+    J = reg_scale * (
         np.diag(-2.0 * np.ones(n_model_dim))
         + np.diag(np.ones(n_model_dim - 1), k=1)
         + np.diag(np.ones(n_model_dim - 1), k=-1)

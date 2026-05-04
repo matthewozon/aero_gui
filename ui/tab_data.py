@@ -42,7 +42,8 @@ class DataTab(QWidget):
         super().__init__(parent)
         self.dataset = dataset
         self.main_window = parent
-        self._tsi_result = None   # last TSIResult (for seeding the model tab)
+        self._tsi_result = None
+        self._sim_model_params = None
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -62,7 +63,11 @@ class DataTab(QWidget):
         grp_fmt = QGroupBox("File Format")
         fmt_l = QVBoxLayout(grp_fmt)
         self.cmb_format = QComboBox()
-        self.cmb_format.addItems(["Generic (CSV / Excel)", "TSI SMPS (xlsx)"])
+        self.cmb_format.addItems([
+            "Generic (CSV / Excel)",
+            "TSI SMPS (xlsx)",
+            "Simulator output (xlsx)",
+        ])
         self.cmb_format.currentIndexChanged.connect(self._on_format_changed)
         fmt_l.addWidget(self.cmb_format)
         left.addWidget(grp_fmt)
@@ -81,6 +86,12 @@ class DataTab(QWidget):
         self.btn_open_tsi.clicked.connect(self._open_tsi)
         self.btn_open_tsi.setVisible(False)
         file_l.addWidget(self.btn_open_tsi)
+
+        # Simulator open button
+        self.btn_open_sim = QPushButton("Open simulator output xlsx…")
+        self.btn_open_sim.clicked.connect(self._open_simulator)
+        self.btn_open_sim.setVisible(False)
+        file_l.addWidget(self.btn_open_sim)
 
         self._lbl_sheet = QLabel("Sheet:")
         self._lbl_sheet.setVisible(False)
@@ -280,13 +291,16 @@ class DataTab(QWidget):
                 self.spn_d_min.setValue(100)
 
     def _on_format_changed(self, index: int):
-        is_tsi = (index == 1)
-        self.btn_open_generic.setVisible(not is_tsi)
+        is_generic = (index == 0)
+        is_tsi     = (index == 1)
+        is_sim     = (index == 2)
+        self.btn_open_generic.setVisible(is_generic)
         self.btn_open_tsi.setVisible(is_tsi)
+        self.btn_open_sim.setVisible(is_sim)
         self._lbl_sheet.setVisible(False)
         self.cmb_sheet.setVisible(False)
         self.btn_seed_model.setVisible(False)
-        self.grp_cols.setVisible(not is_tsi)
+        self.grp_cols.setVisible(is_generic)
 
     # ------------------------------------------------------------------
     # Generic loading (original behaviour)
@@ -382,6 +396,7 @@ class DataTab(QWidget):
         try:
             tsi = self.dataset.load_tsi(path, sheet_name)
             self._tsi_result = tsi
+            self._sim_model_params = None
         except Exception as e:
             QMessageBox.critical(self, "TSI load error", str(e))
             return
@@ -405,17 +420,118 @@ class DataTab(QWidget):
             )
 
     # ------------------------------------------------------------------
+    # Simulator output loading
+    # ------------------------------------------------------------------
+
+    def _open_simulator(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open simulator output", "",
+            "Excel workbook (*.xlsx);;All files (*)"
+        )
+        if not path:
+            return
+        self._load_simulator_file(path)
+
+    def _load_simulator_file(self, path: str):
+        import pandas as pd
+
+        self._tsi_result = None
+        self._sim_model_params = None
+
+        try:
+            df_N = pd.read_excel(path, sheet_name="Size_Distribution")
+        except Exception as e:
+            QMessageBox.critical(self, "Load error",
+                                 f"Could not read 'Size_Distribution' sheet:\n{e}")
+            return
+
+        if "Time_s" not in df_N.columns:
+            QMessageBox.critical(self, "Load error",
+                                 "Expected a 'Time_s' column in Size_Distribution sheet.")
+            return
+
+        times  = df_N["Time_s"].to_numpy(dtype=float)
+        dp_cols = [c for c in df_N.columns if c != "Time_s"]
+        try:
+            diameters = np.array([float(c) for c in dp_cols])
+        except ValueError:
+            QMessageBox.critical(self, "Load error",
+                                 "Diameter column names must be numeric (nm).")
+            return
+
+        count_matrix = df_N[dp_cols].to_numpy(dtype=float)  # (n_t, n_bins)
+
+        # Populate dataset
+        ds = self.dataset
+        ds.filepath      = path
+        ds.times         = times
+        ds.diameters     = diameters
+        ds.count_matrix  = count_matrix
+        ds.column_roles  = {"time": "Time_s", "diameters": dp_cols, "meta": []}
+        ds.raw_df        = df_N.copy()
+
+        # Try to also load simulated measurements as raw_counts
+        try:
+            df_meas = pd.read_excel(path, sheet_name="Simulated_Measurements")
+            meas_cols = [c for c in df_meas.columns if c != "Time_s"]
+            ds.raw_counts    = df_meas[meas_cols].to_numpy(dtype=float)
+            ds.raw_diameters = np.tile(
+                np.array([float(c) for c in meas_cols]), (len(times), 1))
+            ds.raw_times     = times
+        except Exception:
+            pass  # measurements sheet is optional
+
+        # Populate export column list
+        self.lst_export_cols.clear()
+        for c in ds.columns:
+            self.lst_export_cols.addItem(c)
+
+        self.lbl_file.setText(path.split("/")[-1])
+        self._log(f"Simulator file: {path.split('/')[-1]}")
+        self._log(ds.summary())
+
+        # Try to read and log simulation parameters
+        try:
+            df_params = pd.read_excel(path, sheet_name="Simulation_Parameters")
+            params_str = ", ".join(
+                f"{r['Parameter']}={r['Value']}"
+                for _, r in df_params.iterrows()
+            )
+            self._log(f"Sim params: {params_str}")
+        except Exception:
+            pass
+
+        # Read measurement model parameters for seeding
+        try:
+            df_mp = pd.read_excel(path, sheet_name="Measurement_Model_Parameters")
+            self._sim_model_params = dict(zip(df_mp["Parameter"], df_mp["Value"]))
+            self.btn_seed_model.setVisible(True)
+        except Exception:
+            pass
+
+        if self.main_window:
+            self.main_window.set_status(
+                f"Simulator output loaded — {len(times)} time steps, "
+                f"{len(diameters)} bins"
+            )
+
+        self._plot_heatmap_dn()
+
+    # ------------------------------------------------------------------
     # Seed model tab
     # ------------------------------------------------------------------
 
     def _seed_model_tab(self):
-        if self._tsi_result is None:
-            return
         if self.main_window is None:
             return
-        hints = self._tsi_result.instrument_hints()
         try:
-            self.main_window.tab_model.seed_from_tsi(hints)
+            if self._tsi_result is not None:
+                hints = self._tsi_result.instrument_hints()
+                self.main_window.tab_model.seed_from_tsi(hints)
+            elif self._sim_model_params is not None:
+                self.main_window.tab_model.seed_from_sim(self._sim_model_params)
+            else:
+                return
             self.main_window.tabs.setCurrentWidget(self.main_window.tab_model)
             self._log("Instrument parameters forwarded to Measurement Model tab.")
         except Exception as e:

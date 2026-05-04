@@ -253,7 +253,7 @@ class SimulationTab(QWidget):
         gl.addWidget(self.spn_dpmax, 1, 1)
         gl.addWidget(QLabel("# bins:"), 2, 0)
         self.spn_nbins = QSpinBox()
-        self.spn_nbins.setRange(8, 512); self.spn_nbins.setValue(64)
+        self.spn_nbins.setRange(8, 4096); self.spn_nbins.setValue(128)
         gl.addWidget(self.spn_nbins, 2, 1)
         left.addWidget(grp_grid)
 
@@ -868,20 +868,108 @@ class SimulationTab(QWidget):
             QMessageBox.warning(self, "Save", "Run a simulation first.")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save simulation", "sim_result.csv", "CSV (*.csv)")
+            self, "Save simulation results", "sim_result.xlsx",
+            "Excel workbook (*.xlsx)")
         if not path:
             return
+
         import pandas as pd
+
         times = self._gde_result['times']
         dp_nm = self._gde_result['dp_nm']
-        N     = self._gde_result['N']   # (nbin, n_t)
-        df = pd.DataFrame(
-            N.T,
-            index=pd.Index(times, name="time_s"),
-            columns=pd.Index(dp_nm, name="Dp_nm"),
-        )
-        df.to_csv(path)
-        self._log(f"Saved → {path}")
+        N     = self._gde_result['N']          # (nbin, n_t)
+        dp_cols = [f"{d:.4g}" for d in dp_nm]
+
+        # ── Sheet 1: size distribution ─────────────────────────────────
+        df_N = pd.DataFrame(N.T, columns=dp_cols)
+        df_N.insert(0, "Time_s", times)
+
+        # ── Sheet 2: simulated measurements (deterministic) ────────────
+        df_meas = None
+        if self._Y_det is not None and self._meas_meta is not None:
+            dp_ch   = self._meas_meta['dp_ch']
+            ch_cols = [f"{d:.4g}" for d in dp_ch]
+            df_meas = pd.DataFrame(self._Y_det.T, columns=ch_cols)
+            df_meas.insert(0, "Time_s", times)
+
+        # ── Sheet 3: simulation parameters ────────────────────────────
+        sim_params = {
+            "dp_min_nm":         self.spn_dpmin.value(),
+            "dp_max_nm":         self.spn_dpmax.value(),
+            "n_bins":            self.spn_nbins.value(),
+            "t_end_s":           self.spn_tend.value(),
+            "dt_output_s":       self.spn_dtout.value(),
+            "coagulation":       self.chk_coag.isChecked(),
+            "condensation":      self.chk_cond.isChecked(),
+            "nucleation":        self.chk_nucl.isChecked(),
+            "wall_deposition":   self.chk_dep.isChecked(),
+            "temperature_K":     self.spn_T.value(),
+            "pressure_Pa":       self.spn_P.value(),
+            "particle_density_kg_m3": self.spn_rho.value(),
+            "growth_rate_nm_h":  self.spn_gr.value(),
+            "kelvin_correction": self.chk_kelvin.isChecked(),
+            "supersaturation":   self.spn_S.value(),
+            "surface_tension_mN_m": self.spn_sigma.value(),
+            "molar_mass_g_mol":  self.spn_Mc.value(),
+            "condensate_density_kg_m3": self.spn_rho_c.value(),
+            "nucleation_rate_cm3_s": self.spn_J.value(),
+            "nuc_profile":       self.cmb_nuc.currentText(),
+            "nuc_peak_min":      self.spn_nuc_peak.value(),
+            "nuc_width_min":     self.spn_nuc_width.value(),
+            "N0_cm3":            self.spn_N0.value(),
+            "Dg_nm":             self.spn_Dg.value(),
+            "sigma_g":           self.spn_sg.value(),
+            "backend":           self.cmb_backend.currentText(),
+        }
+        df_sim_params = pd.DataFrame(
+            list(sim_params.items()), columns=["Parameter", "Value"])
+
+        # ── Sheet 4: measurement model parameters ──────────────────────
+        df_model_params = None
+        if (self._Y_det is not None
+                and self.main_window
+                and hasattr(self.main_window, 'tab_model')):
+            mt = self.main_window.tab_model
+            model_params = {
+                "tf_model":              mt.cmb_tf.currentText(),
+                "inner_radius_cm":       mt.spn_r1.value(),
+                "outer_radius_cm":       mt.spn_r2.value(),
+                "length_cm":             mt.spn_L.value(),
+                "sheath_flow_L_min":     mt.spn_Qsh.value(),
+                "aerosol_flow_L_min":    mt.spn_Qa.value(),
+                "temperature_K":         mt.spn_T.value(),
+                "pressure_Pa":           mt.spn_P.value(),
+                "max_charges_Nq":        mt.spn_Nq.value(),
+                "v_min_V":               mt.spn_Vmin.value(),
+                "v_max_V":               mt.spn_Vmax.value(),
+                "n_channels":            mt.spn_nch.value(),
+                "dp_min_nm":             mt.spn_dpmin.value(),
+                "dp_max_nm":             mt.spn_dpmax.value(),
+                "n_bins":                mt.spn_nbins.value(),
+                "cpc_d50_nm":            mt.spn_d50.value(),
+                "cpc_delta50_nm":        mt.spn_dcpc.value(),
+                "impactor_d50_nm":       mt.spn_imp_d50.value(),
+                "impactor_delta50_nm":   mt.spn_imp_delta.value(),
+            }
+            df_model_params = pd.DataFrame(
+                list(model_params.items()), columns=["Parameter", "Value"])
+
+        # ── Write workbook ─────────────────────────────────────────────
+        try:
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                df_N.to_excel(writer, sheet_name="Size_Distribution", index=False)
+                if df_meas is not None:
+                    df_meas.to_excel(writer, sheet_name="Simulated_Measurements",
+                                     index=False)
+                df_sim_params.to_excel(writer, sheet_name="Simulation_Parameters",
+                                       index=False)
+                if df_model_params is not None:
+                    df_model_params.to_excel(
+                        writer, sheet_name="Measurement_Model_Parameters",
+                        index=False)
+            self._log(f"Saved → {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save error", str(e))
 
     # ── helpers ────────────────────────────────────────────────────────
 

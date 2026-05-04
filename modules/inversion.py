@@ -330,26 +330,31 @@ class AeroInvRegCP(InversionMethod):
 
     name = "Chambolle-Pock / Gaussian (AeroInv)"
 
-    def __init__(self, tau00: float = 1e15, Niter: int = 1000):
+    def __init__(self, tau00: float = 1e15, Niter: int = 1000,
+                 reg_scale: float = 1.0):
         """
         Parameters
         ----------
-        tau00 : initial primal step size
-        Niter : Chambolle-Pock iterations per scan
+        tau00     : initial primal step size
+        Niter     : Chambolle-Pock iterations per scan
+        reg_scale : weight on the second-order regularisation operator J
         """
-        self.tau00 = tau00
-        self.Niter = Niter
+        self.tau00     = tau00
+        self.Niter     = Niter
+        self.reg_scale = reg_scale
 
     def solve(self, A: np.ndarray, counts: np.ndarray,
               dp_grid: np.ndarray) -> InversionResult:
         from modules.aeroinv import aeroinv_reg
         y2d = counts[:, np.newaxis]          # (n_data, 1)
-        F_ALL, _ = aeroinv_reg(y2d, A, tau00=self.tau00, Niter=self.Niter)
+        F_ALL, _ = aeroinv_reg(y2d, A, tau00=self.tau00, Niter=self.Niter,
+                               reg_scale=self.reg_scale)
         N = F_ALL[0]
         residual = np.linalg.norm(A @ N - counts) / (np.linalg.norm(counts) + 1e-30)
         return InversionResult(N_retrieved=N, dp_grid=dp_grid,
                                residual=residual,
-                               info={"tau00": self.tau00, "Niter": self.Niter})
+                               info={"tau00": self.tau00, "Niter": self.Niter,
+                                     "reg_scale": self.reg_scale})
 
     def solve_series(self, A: np.ndarray, count_matrix: np.ndarray,
                      dp_grid: np.ndarray) -> np.ndarray:
@@ -367,7 +372,8 @@ class AeroInvRegCP(InversionMethod):
         from modules.aeroinv import aeroinv_reg
         # aeroinv_reg expects y shape (n_data, Nt)
         y = count_matrix.T                   # (n_channels, n_scans)
-        F_ALL, _ = aeroinv_reg(y, A, tau00=self.tau00, Niter=self.Niter)
+        F_ALL, _ = aeroinv_reg(y, A, tau00=self.tau00, Niter=self.Niter,
+                               reg_scale=self.reg_scale)
         return F_ALL                         # (n_scans, n_dp_model)
 
 

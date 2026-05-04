@@ -73,8 +73,9 @@ _PARAM_DEFS = {
         ("Rel. uncertainty:", "spn_rel_un", "double", 1e-4, 0.99, 0.1, 4),
     ],
     "Chambolle-Pock / Gaussian (AeroInv)": [
-        ("Initial step τ₀:", "spn_tau00", "double", 1.0, 1e18, 1e15, 0),
-        ("Iterations:",      "spn_niter", "int",    10,  5000, 1000, 0),
+        ("Initial step τ₀:", "spn_tau00", "double", 1.0,  1e18, 1e15, 0),
+        ("Iterations:",      "spn_niter", "int",    10,   5000, 1000, 0),
+        ("Reg. scale:",      "spn_reg",   "double", 1e-6, 1e3,  1.0,  6),
     ],
     "Chambolle-Pock / Poisson (AeroInv)": [
         ("Initial step τ₀:",    "spn_tau0",    "double", 1e-3, 1e6,  1.0,  3),
@@ -103,6 +104,8 @@ class InversionTab(QWidget):
         self._kernel_csv = None     # fallback kernel from CSV
         self._dp_grid_csv = None
         self._param_widgets: dict = {}   # attr_name → widget
+        self._last_A      = None    # kernel used in last inversion
+        self._last_counts = None    # aligned counts used in last inversion
 
         self._build_ui()
 
@@ -321,7 +324,8 @@ class InversionTab(QWidget):
                        rel_un=p["spn_rel_un"].value())
         elif name == "Chambolle-Pock / Gaussian (AeroInv)":
             return cls(tau00=p["spn_tau00"].value(),
-                       Niter=p["spn_niter"].value())
+                       Niter=p["spn_niter"].value(),
+                       reg_scale=p["spn_reg"].value())
         elif name == "Chambolle-Pock / Poisson (AeroInv)":
             return cls(tau0=p["spn_tau0"].value(),
                        Niter=p["spn_niter"].value(),
@@ -411,6 +415,8 @@ class InversionTab(QWidget):
         counts = self._align_counts(self.dataset.count_matrix[idx], A.shape[0])
         result = method.solve(A, counts, dp_grid)
         self.last_result = result.N_retrieved
+        self._last_A = A
+        self._last_counts = counts
         self._plot_single(result, dp_grid, idx)
         self._log(
             f"[{method.name}]  scan {idx}\n"
@@ -424,18 +430,18 @@ class InversionTab(QWidget):
 
     def _run_all_scans(self, method, name, A, dp_grid):
         """Invert all scans; use aeroinv_reg's native warm-start if selected."""
+        count_matrix = self._align_matrix(self.dataset.count_matrix, A.shape[0])
         if name == "Chambolle-Pock / Gaussian (AeroInv)":
-            # AeroInvRegCP has an efficient series solver
-            count_matrix = self._align_matrix(self.dataset.count_matrix, A.shape[0])
             self.last_result = method.solve_series(A, count_matrix, dp_grid)
         else:
             results = []
-            for i in range(self.dataset.n_scans):
-                counts = self._align_counts(self.dataset.count_matrix[i], A.shape[0])
-                r = method.solve(A, counts, dp_grid)
+            for i in range(count_matrix.shape[0]):
+                r = method.solve(A, count_matrix[i], dp_grid)
                 results.append(r.N_retrieved)
             self.last_result = np.array(results)
 
+        self._last_A = A
+        self._last_counts = count_matrix   # (n_scans, n_channels)
         self._plot_heatmap(dp_grid)
         self._log(
             f"[{method.name}]  all {self.dataset.n_scans} scans\n"
@@ -475,38 +481,95 @@ class InversionTab(QWidget):
     # Plots
     # ------------------------------------------------------------------
 
-    def _plot_single(self, result, dp_grid, scan_idx):
-        self.fig.clear()
-        ax = self.fig.add_subplot(111)
+    def _get_channel_diameters(self, n_channels: int):
+        """Return (dp_array, is_diameter_nm). Prefers model tab diameters."""
+        if self.main_window and hasattr(self.main_window, 'tab_model'):
+            m = self.main_window.tab_model.model
+            if (m is not None and m.diameters is not None
+                    and len(m.diameters) == n_channels):
+                return m.diameters, True
+        return np.arange(1, n_channels + 1), False
+
+    def _style_ax(self, ax):
         ax.set_facecolor("#181825")
-        N = result.N_retrieved
-        ax.semilogx(dp_grid, N, color="#a6e3a1", linewidth=2)
-        ax.fill_between(dp_grid, N, alpha=0.25, color="#a6e3a1")
-        ax.set_xlabel("Diameter Dp (nm)", color="#cdd6f4")
-        ax.set_ylabel("dN/dlogDp", color="#cdd6f4")
-        ax.set_title(f"Retrieved size distribution — scan {scan_idx}", color="#cdd6f4")
         ax.tick_params(colors="#cdd6f4")
         for s in ax.spines.values():
             s.set_edgecolor("#45475a")
+
+    def _plot_single(self, result, dp_grid, scan_idx):
+        N = result.N_retrieved
+        self.fig.clear()
+
+        ax1 = self.fig.add_subplot(211)
+        ax2 = self.fig.add_subplot(212)
+        self._style_ax(ax1)
+        self._style_ax(ax2)
+
+        # ── Top: retrieved size distribution ──────────────────────
+        ax1.semilogx(dp_grid, N, color="#a6e3a1", linewidth=2)
+        ax1.fill_between(dp_grid, N, alpha=0.25, color="#a6e3a1")
+        ax1.set_xlabel("Diameter Dp (nm)", color="#cdd6f4")
+        ax1.set_ylabel("dN/dlogDp", color="#cdd6f4")
+        ax1.set_title(f"Retrieved size distribution — scan {scan_idx}",
+                      color="#cdd6f4")
+
+        # ── Bottom: A · N̂ vs data ─────────────────────────────────
+        Y_rec = self._last_A @ N
+        dp_ch, is_dp = self._get_channel_diameters(len(Y_rec))
+        ax2.plot(dp_ch, self._last_counts, color="#89b4fa", linewidth=1.5,
+                 label="Data")
+        ax2.plot(dp_ch, Y_rec, color="#f38ba8", linewidth=1.5,
+                 linestyle="--", label="A · N̂")
+        if is_dp:
+            ax2.set_xscale("log")
+        ax2.set_xlabel("Selected Dp (nm)" if is_dp else "Channel index",
+                       color="#cdd6f4")
+        ax2.set_ylabel("Counts", color="#cdd6f4")
+        ax2.set_title("Data vs A · N̂  (reconstructed measurements)",
+                      color="#cdd6f4")
+        ax2.legend(fontsize=8, labelcolor="#cdd6f4",
+                   facecolor="#313244", edgecolor="#45475a")
+
         self.fig.tight_layout()
         self.canvas.draw()
 
     def _plot_heatmap(self, dp_grid):
+        N_ALL = self.last_result          # (n_scans, n_dp)
         self.fig.clear()
-        ax = self.fig.add_subplot(111)
-        ax.set_facecolor("#181825")
-        times = np.arange(self.last_result.shape[0])
-        im = ax.pcolormesh(times, dp_grid, self.last_result.T,
-                            cmap="viridis", shading="auto")
-        ax.set_yscale("log")
-        cb = self.fig.colorbar(im, ax=ax)
-        cb.ax.tick_params(colors="#cdd6f4")
-        ax.set_xlabel("Scan index", color="#cdd6f4")
-        ax.set_ylabel("Dp (nm)", color="#cdd6f4")
-        ax.set_title("Retrieved dN/dlogDp — all scans", color="#cdd6f4")
-        ax.tick_params(colors="#cdd6f4")
-        for s in ax.spines.values():
-            s.set_edgecolor("#45475a")
+
+        ax1 = self.fig.add_subplot(211)
+        ax2 = self.fig.add_subplot(212)
+        self._style_ax(ax1)
+        self._style_ax(ax2)
+
+        times = np.arange(N_ALL.shape[0])
+
+        # ── Top: retrieved N(Dp, t) ────────────────────────────────
+        im1 = ax1.pcolormesh(times, dp_grid, N_ALL.T,
+                              cmap="viridis", shading="auto")
+        ax1.set_yscale("log")
+        cb1 = self.fig.colorbar(im1, ax=ax1)
+        cb1.ax.tick_params(colors="#cdd6f4")
+        ax1.set_xlabel("Scan index", color="#cdd6f4")
+        ax1.set_ylabel("Dp (nm)", color="#cdd6f4")
+        ax1.set_title("Retrieved dN/dlogDp — all scans", color="#cdd6f4")
+
+        # ── Bottom: A · N̂ heatmap ─────────────────────────────────
+        if self._last_A is not None:
+            Y_ALL = self._last_A @ N_ALL.T    # (n_channels, n_scans)
+            dp_ch, is_dp = self._get_channel_diameters(Y_ALL.shape[0])
+            im2 = ax2.pcolormesh(times, dp_ch, Y_ALL,
+                                  cmap="plasma", shading="auto")
+            if is_dp:
+                ax2.set_yscale("log")
+            cb2 = self.fig.colorbar(im2, ax=ax2)
+            cb2.ax.tick_params(colors="#cdd6f4")
+            ax2.set_xlabel("Scan index", color="#cdd6f4")
+            ax2.set_ylabel("Selected Dp (nm)" if is_dp else "Channel index",
+                           color="#cdd6f4")
+            ax2.set_title("A · N̂  (reconstructed measurements) — all scans",
+                          color="#cdd6f4")
+
         self.fig.tight_layout()
         self.canvas.draw()
 

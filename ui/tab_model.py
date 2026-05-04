@@ -125,6 +125,14 @@ class ModelTab(QWidget):
         self._add_spin( sl, 2, "Channels:", "spn_nch",  8,   512,   64)
         left.addWidget(grp_scan)
 
+        # ── Size grid ─────────────────────────────────────────────
+        grp_grid = QGroupBox("Size Grid")
+        grl = QGridLayout(grp_grid)
+        self._add_dspin(grl, 0, "Dp min (nm):", "spn_dpmin", 0.1,  100,   3.0)
+        self._add_dspin(grl, 1, "Dp max (nm):", "spn_dpmax", 10,   10000, 1000.0)
+        self._add_spin( grl, 2, "# bins:",      "spn_nbins", 8,    4096,   200)
+        left.addWidget(grp_grid)
+
         # ── CPC parameters ────────────────────────────────────────
         grp_cpc = QGroupBox("CPC Parameters")
         cpl = QGridLayout(grp_cpc)
@@ -261,8 +269,13 @@ class ModelTab(QWidget):
         try:
             params   = self._build_params()
             tf_model = params.tf_model
+            dp_grid = np.logspace(
+                np.log10(self.spn_dpmin.value()),
+                np.log10(self.spn_dpmax.value()),
+                self.spn_nbins.value(),
+            )
             self.model = MeasurementModel(params, tf_model)
-            self.model.compute()
+            self.model.compute(dp_grid_nm=dp_grid)
 
             Nq  = params.dma.max_charges
             eta, lmfp = _air_properties(params.dma.temperature, params.dma.pressure)
@@ -411,6 +424,47 @@ class ModelTab(QWidget):
             self._log("Seeded from TSI metadata: " + ", ".join(seeded))
         else:
             self._log("No seedable parameters found in TSI metadata.")
+
+    def seed_from_sim(self, params: dict) -> None:
+        """Populate spin-boxes from a Measurement_Model_Parameters dict saved by the simulator."""
+        def _try_dspin(spn, key):
+            if key in params:
+                val = float(params[key])
+                if spn.minimum() <= val <= spn.maximum():
+                    spn.setValue(val)
+
+        def _try_spin(spn, key):
+            if key in params:
+                val = int(params[key])
+                if spn.minimum() <= val <= spn.maximum():
+                    spn.setValue(val)
+
+        _try_dspin(self.spn_r1,        'inner_radius_cm')
+        _try_dspin(self.spn_r2,        'outer_radius_cm')
+        _try_dspin(self.spn_L,         'length_cm')
+        _try_dspin(self.spn_Qsh,       'sheath_flow_L_min')
+        _try_dspin(self.spn_Qa,        'aerosol_flow_L_min')
+        _try_dspin(self.spn_T,         'temperature_K')
+        _try_dspin(self.spn_P,         'pressure_Pa')
+        _try_spin (self.spn_Nq,        'max_charges_Nq')
+        _try_dspin(self.spn_Vmin,      'v_min_V')
+        _try_dspin(self.spn_Vmax,      'v_max_V')
+        _try_spin (self.spn_nch,       'n_channels')
+        _try_dspin(self.spn_dpmin,     'dp_min_nm')
+        _try_dspin(self.spn_dpmax,     'dp_max_nm')
+        _try_spin (self.spn_nbins,     'n_bins')
+        _try_dspin(self.spn_d50,       'cpc_d50_nm')
+        _try_dspin(self.spn_dcpc,      'cpc_delta50_nm')
+        _try_dspin(self.spn_imp_d50,   'impactor_d50_nm')
+        _try_dspin(self.spn_imp_delta, 'impactor_delta50_nm')
+
+        if 'tf_model' in params:
+            idx = self.cmb_tf.findText(str(params['tf_model']))
+            if idx >= 0:
+                self.cmb_tf.setCurrentIndex(idx)
+
+        self._update_air_props()
+        self._log("Seeded from simulator measurement model parameters.")
 
     def _log(self, msg: str):
         self.log.append(msg)
