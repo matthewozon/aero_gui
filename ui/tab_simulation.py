@@ -208,6 +208,8 @@ class SimulationTab(QWidget):
         self.main_window = parent
         self.sim         = None   # GDESimulator or None
         self._gde_result = None   # dict from GDEDirectWorker or None
+        self._Y_det      = None   # deterministic measurements (n_channels, n_t)
+        self._meas_meta  = None   # dict with t_min, dp_ch for replot
         self._build_ui()
 
     # ── UI construction ───────────────────────────────────────────────
@@ -391,6 +393,11 @@ class SimulationTab(QWidget):
         self.btn_kernel.clicked.connect(self._plot_coag_kernel)
         left.addWidget(self.btn_kernel)
 
+        self.btn_redraw_noise = QPushButton("Redraw Measurement Noise")
+        self.btn_redraw_noise.setEnabled(False)
+        self.btn_redraw_noise.clicked.connect(self._redraw_meas_noise)
+        left.addWidget(self.btn_redraw_noise)
+
         self.btn_run = QPushButton("▶  Run Simulation")
         self.btn_run.clicked.connect(self._run_sim)
         left.addWidget(self.btn_run)
@@ -427,6 +434,15 @@ class SimulationTab(QWidget):
         nw = QWidget(); nl3 = QVBoxLayout(nw)
         nl3.addWidget(self.tb_N); nl3.addWidget(self.canvas_N)
         self.plot_tabs.addTab(nw, "Total N(t)")
+
+        self.fig_meas = Figure(figsize=(9, 5), facecolor="#1e1e2e")
+        self.canvas_meas = FigureCanvas(self.fig_meas)
+        self.canvas_meas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas_meas.setMinimumSize(100, 100)
+        self.tb_meas = NavigationToolbar(self.canvas_meas, self)
+        meas_w = QWidget(); meas_l = QVBoxLayout(meas_w)
+        meas_l.addWidget(self.tb_meas); meas_l.addWidget(self.canvas_meas)
+        self.plot_tabs.addTab(meas_w, "Simulated Measurements")
 
         self.fig_coag = Figure(figsize=(9, 5), facecolor="#1e1e2e")
         self.canvas_coag = FigureCanvas(self.fig_coag)
@@ -652,8 +668,76 @@ class SimulationTab(QWidget):
 
         self.fig_coag.tight_layout()
         self.canvas_coag.draw()
-        self.plot_tabs.setCurrentIndex(2)
+        self.plot_tabs.setCurrentIndex(3)
         self._log("Coagulation kernel plotted.")
+
+    def _plot_simulated_measurements(self):
+        from modules.measurement_model import MeasurementModel
+
+        self.fig_meas.clear()
+        ax = self.fig_meas.add_subplot(111)
+        ax.set_facecolor("#181825")
+
+        if not (self.main_window and hasattr(self.main_window, 'tab_model')):
+            ax.text(0.5, 0.5, "No main window reference",
+                    ha="center", va="center", color="#6c7086",
+                    transform=ax.transAxes)
+            self.canvas_meas.draw()
+            return
+
+        try:
+            params   = self.main_window.tab_model._build_params()
+            tf_model = params.tf_model
+        except Exception as e:
+            ax.text(0.5, 0.5, f"Could not read model parameters:\n{e}",
+                    ha="center", va="center", color="#6c7086",
+                    transform=ax.transAxes)
+            self.canvas_meas.draw()
+            return
+
+        times = self._gde_result['times']
+        dp_nm = self._gde_result['dp_nm']   # (nbin,) — GDE grid
+        N     = self._gde_result['N']        # (nbin, n_t)
+        t_min = times / 60.0
+
+        # Recompute the kernel on the GDE diameter grid so A @ N is exact
+        model = MeasurementModel(params, tf_model)
+        model.compute(dp_grid_nm=dp_nm)
+
+        Y_det = model.kernel @ N       # (n_channels, n_t)  deterministic
+        dp_ch = model.diameters        # (n_channels,) selected Dp [nm]
+
+        # Store for noise redraws without rerunning the simulation
+        self._Y_det     = Y_det
+        self._meas_meta = {'t_min': t_min, 'dp_ch': dp_ch}
+        self.btn_redraw_noise.setEnabled(True)
+
+        self._draw_meas_heatmap(np.random.poisson(np.maximum(Y_det, 0.0)))
+
+    def _redraw_meas_noise(self):
+        if self._Y_det is None:
+            return
+        self._draw_meas_heatmap(np.random.poisson(np.maximum(self._Y_det, 0.0)))
+
+    def _draw_meas_heatmap(self, Y: np.ndarray):
+        t_min = self._meas_meta['t_min']
+        dp_ch = self._meas_meta['dp_ch']
+        self.fig_meas.clear()
+        ax = self.fig_meas.add_subplot(111)
+        ax.set_facecolor("#181825")
+        im = ax.pcolormesh(t_min, dp_ch, Y, cmap="plasma", shading="auto")
+        ax.set_yscale("log")
+        cb = self.fig_meas.colorbar(im, ax=ax)
+        cb.ax.tick_params(colors="#cdd6f4")
+        cb.set_label("Simulated counts [#]", color="#cdd6f4")
+        ax.set_xlabel("Time (min)", color="#cdd6f4")
+        ax.set_ylabel("Selected Dₚ (nm)", color="#cdd6f4")
+        ax.set_title("Simulated Measurements  (A · N + Poisson noise)", color="#cdd6f4")
+        ax.tick_params(colors="#cdd6f4")
+        for s in ax.spines.values():
+            s.set_edgecolor("#45475a")
+        self.fig_meas.tight_layout()
+        self.canvas_meas.draw()
 
     def _plot_physics(self):
         """Plot wall loss rate, growth rate heatmap, and nucleation rate."""
@@ -774,6 +858,8 @@ class SimulationTab(QWidget):
         if self.chk_coag.isChecked():
             self._plot_coag_kernel()
         self._plot_physics()
+        self._plot_simulated_measurements()
+        self.plot_tabs.setCurrentIndex(0)
 
     # ── save ───────────────────────────────────────────────────────────
 
