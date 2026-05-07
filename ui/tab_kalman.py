@@ -56,6 +56,7 @@ class KalmanTab(QWidget):
         self._last_std    = None    # sqrt(diag(P_fil or P_smo)), shape (n_scans, n_dp)
         self._last_A      = None
         self._last_counts = None
+        self._scan_offset = 0       # first absolute scan index of the last run
 
         self._build_ui()
 
@@ -142,6 +143,36 @@ class KalmanTab(QWidget):
         self.spn_r_min = self._dspin(1e-6, 1e9, 2.0, 4)
         Rl.addWidget(self.spn_r_min, 0, 1)
         left.addWidget(grp_R)
+
+        # Time range selection
+        grp_time = QGroupBox("Time Range Selection")
+        Tl = QGridLayout(grp_time)
+
+        Tl.addWidget(QLabel("Start scan:"), 0, 0)
+        self.spn_t_start = QSpinBox()
+        self.spn_t_start.setMinimum(0)
+        self.spn_t_start.setMaximum(0)
+        Tl.addWidget(self.spn_t_start, 0, 1)
+        self.lbl_t_start = QLabel("—")
+        self.lbl_t_start.setStyleSheet("color: #a6adc8; font-size: 10px;")
+        Tl.addWidget(self.lbl_t_start, 0, 2)
+
+        Tl.addWidget(QLabel("End scan:"), 1, 0)
+        self.spn_t_end = QSpinBox()
+        self.spn_t_end.setMinimum(0)
+        self.spn_t_end.setMaximum(0)
+        Tl.addWidget(self.spn_t_end, 1, 1)
+        self.lbl_t_end = QLabel("—")
+        self.lbl_t_end.setStyleSheet("color: #a6adc8; font-size: 10px;")
+        Tl.addWidget(self.lbl_t_end, 1, 2)
+
+        btn_reset_range = QPushButton("Reset to full range")
+        btn_reset_range.clicked.connect(self._reset_time_range)
+        Tl.addWidget(btn_reset_range, 2, 0, 1, 3)
+
+        self.spn_t_start.valueChanged.connect(self._update_time_labels)
+        self.spn_t_end.valueChanged.connect(self._update_time_labels)
+        left.addWidget(grp_time)
 
         # Spatial regularization via D₂ augmentation
         grp_reg = QGroupBox("Spatial Regularization  (D₂ augmentation)")
@@ -256,11 +287,15 @@ class KalmanTab(QWidget):
     def _refresh_status(self):
         if self.dataset.count_matrix is not None:
             dp = self.dataset.diameters
+            n  = self.dataset.n_scans
             self.lbl_data.setText(
-                f"✓  {self.dataset.n_scans} scans  ×  {self.dataset.n_bins} bins\n"
+                f"✓  {n} scans  ×  {self.dataset.n_bins} bins\n"
                 f"   Dp: {dp[0]:.1f} – {dp[-1]:.1f} nm"
             )
             self.lbl_data.setStyleSheet("color: #a6e3a1;")
+            # Sync time-range spinboxes when the dataset changes
+            if self.spn_t_end.maximum() != n - 1:
+                self._set_range_spinboxes(0, n - 1)
         else:
             self.lbl_data.setText(
                 "✗  No data loaded.\n   Load a file in the Data tab."
@@ -279,6 +314,50 @@ class KalmanTab(QWidget):
                 "✗  No kernel.\n   Compute one in the Measurement Model tab."
             )
             self.lbl_model.setStyleSheet("color: #f38ba8;")
+
+    # ------------------------------------------------------------------
+    # Time range helpers
+    # ------------------------------------------------------------------
+
+    def _format_time(self, idx: int) -> str:
+        """Human-readable label for scan at absolute index idx."""
+        t = getattr(self.dataset, "times", None)
+        if t is None or idx >= len(t):
+            return f"scan {idx}"
+        v = t[idx]
+        try:
+            ts = pd.Timestamp(v)
+            return ts.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            try:
+                return f"{float(v):.4g}"
+            except Exception:
+                return str(v)
+
+    def _set_range_spinboxes(self, start: int, end: int):
+        """Update both spinboxes and their labels without triggering loops."""
+        n = self.dataset.n_scans if self.dataset.count_matrix is not None else 0
+        for spn in (self.spn_t_start, self.spn_t_end):
+            spn.blockSignals(True)
+            spn.setMaximum(max(n - 1, 0))
+        self.spn_t_start.setValue(start)
+        self.spn_t_end.setValue(end)
+        for spn in (self.spn_t_start, self.spn_t_end):
+            spn.blockSignals(False)
+        self._update_time_labels()
+
+    def _update_time_labels(self):
+        if self.dataset.count_matrix is None:
+            self.lbl_t_start.setText("—")
+            self.lbl_t_end.setText("—")
+            return
+        self.lbl_t_start.setText(self._format_time(self.spn_t_start.value()))
+        self.lbl_t_end.setText(self._format_time(self.spn_t_end.value()))
+
+    def _reset_time_range(self):
+        if self.dataset.count_matrix is None:
+            return
+        self._set_range_spinboxes(0, self.dataset.n_scans - 1)
 
     # ------------------------------------------------------------------
     # Kernel helper
@@ -394,8 +473,16 @@ class KalmanTab(QWidget):
             )
             return
 
+        # Time range selection
+        start = self.spn_t_start.value()
+        end   = self.spn_t_end.value()
+        if start > end:
+            QMessageBox.warning(self, "Invalid range",
+                                f"Start scan ({start}) must be ≤ end scan ({end}).")
+            return
+        full_matrix  = self.dataset.count_matrix[start:end + 1]
         method       = self._make_method()
-        count_matrix = self._align_matrix(self.dataset.count_matrix, A.shape[0])
+        count_matrix = self._align_matrix(full_matrix, A.shape[0])
 
         try:
             ws            = method._run_series(A, count_matrix)
@@ -408,8 +495,9 @@ class KalmanTab(QWidget):
         self._last_std    = std_ALL
         self._last_A      = A
         self._last_counts = count_matrix
+        self._scan_offset = start
 
-        # Keep scan spinbox in range
+        # Keep scan spinbox in range (relative to the selected sub-range)
         n_scans = N_ALL.shape[0]
         self.spn_scan_idx.setMaximum(n_scans - 1)
         self.spn_scan_idx.setValue(0)
@@ -422,17 +510,20 @@ class KalmanTab(QWidget):
         self._plot_results(dp_grid)
         self.plot_tabs.setCurrentIndex(1)
 
+        range_note = (f"scans {start}–{end}"
+                      if (start > 0 or end < self.dataset.n_scans - 1)
+                      else f"all {n_scans} scans")
         reg_note = (f"  D₂ reg: σ²={self.spn_reg_var.value():.3g}"
                     if self.chk_reg.isChecked() else "  D₂ reg: off")
         self._log(
-            f"[{self.cmb_method.currentText()}]  {n_scans} scans\n"
+            f"[{self.cmb_method.currentText()}]  {range_note}\n"
             f"  N ∈ [{N_ALL.min():.3g}, {N_ALL.max():.3g}]\n"
             f"  std ∈ [{std_ALL.min():.3g}, {std_ALL.max():.3g}]\n"
             f"{reg_note}"
         )
         if self.main_window:
             self.main_window.set_status(
-                f"Kalman inversion complete — {n_scans} scans."
+                f"Kalman inversion complete — {range_note}."
             )
 
     # ------------------------------------------------------------------
@@ -461,11 +552,14 @@ class KalmanTab(QWidget):
             ax.fill_between(dp_grid, np.maximum(N - std, 0.0), N + std,
                             alpha=0.3, color="#89b4fa", label="±1σ")
 
+        abs_idx   = self._scan_offset + t_idx
+        time_str  = self._format_time(abs_idx)
+
         ax.set_xscale("log")
         ax.set_xlabel("Dp (nm)", color="#cdd6f4")
         ax.set_ylabel("dN/dlogDp  (cm⁻³)", color="#cdd6f4")
         ax.set_title(
-            f"Size distribution — scan {t_idx}"
+            f"Size distribution — scan {abs_idx}  ({time_str})"
             f"  [{self.cmb_method.currentText()}]",
             color="#cdd6f4"
         )
@@ -506,7 +600,7 @@ class KalmanTab(QWidget):
         for ax in (ax1, ax2, ax3):
             self._style_ax(ax)
 
-        times = np.arange(N_ALL.shape[0])
+        times = np.arange(N_ALL.shape[0]) + self._scan_offset
 
         # ── Top: retrieved N(Dp, t) ────────────────────────────────────
         im1 = ax1.pcolormesh(times, dp_grid, N_ALL.T,
