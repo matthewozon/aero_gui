@@ -188,6 +188,21 @@ class DataTab(QWidget):
         self.btn_plot_ts = QPushButton("Plot")
         self.btn_plot_ts.clicked.connect(self._plot_time_series)
         tsl.addWidget(self.btn_plot_ts, 3, 0, 1, 2)
+
+        # Smooth fit controls — only shown for mode 0
+        self.chk_fit = QCheckBox("Show smooth fit && residuals")
+        self.chk_fit.setChecked(False)
+        tsl.addWidget(self.chk_fit, 4, 0, 1, 2)
+
+        self._lbl_reg = QLabel("λ (regularization):")
+        tsl.addWidget(self._lbl_reg, 5, 0)
+        self.spn_reg = QDoubleSpinBox()
+        self.spn_reg.setRange(1e-6, 1e12)
+        self.spn_reg.setDecimals(6)
+        self.spn_reg.setValue(1.0)
+        self.spn_reg.setSingleStep(1.0)
+        tsl.addWidget(self.spn_reg, 5, 1)
+
         left.addWidget(grp_ts)
 
         # ── Export ────────────────────────────────────────────────────
@@ -275,6 +290,11 @@ class DataTab(QWidget):
         show_b = (index == 0)
         self._lbl_ts_b.setVisible(show_b)
         self.spn_d_max.setVisible(show_b)
+
+        show_fit = (index == 0)
+        self.chk_fit.setVisible(show_fit)
+        self._lbl_reg.setVisible(show_fit)
+        self.spn_reg.setVisible(show_fit)
 
         if index == 1:          # scan index: integer steps, reset range after data loaded
             self.spn_d_min.setDecimals(0)
@@ -670,7 +690,29 @@ class DataTab(QWidget):
             ylabel = "Total dN/dlogDp"
             title  = f"dN/dlogDp {d_min:.0f}–{d_max:.0f} nm vs. scan"
 
-        self._draw_ts_scan(np.arange(len(ts)), ts, "Scan index", ylabel, title)
+        # Median of time-difference across diameter bins for each scan
+        med_diff_curve = None
+        try:
+            if use_raw and self.dataset.raw_counts is not None:
+                dp_ref = self.dataset.raw_diameters[0]   # same voltage programme each scan
+                mask2d = (dp_ref >= d_min) & (dp_ref <= d_max)
+                mat    = self.dataset.raw_counts[:, mask2d]
+            elif not use_raw and self.dataset.count_matrix is not None:
+                mask2d = (self.dataset.diameters >= d_min) & (self.dataset.diameters <= d_max)
+                mat    = self.dataset.count_matrix[:, mask2d]
+            else:
+                mat = None
+            if mat is not None and mat.shape[0] > 1 and mat.shape[1] > 0:
+                diff_mat       = np.diff(mat.astype(float), axis=0)   # (n-1, n_dp)
+                med_diff_curve = np.median(diff_mat, axis=1)          # (n-1,)
+        except Exception:
+            med_diff_curve = None
+
+        x = np.arange(len(ts))
+        if self.chk_fit.isChecked():
+            self._draw_ts_with_fit(x, ts, ylabel, title, med_diff_curve=med_diff_curve)
+        else:
+            self._draw_ts_scan(x, ts, "Scan index", ylabel, title)
 
     # -- mode 1: full size distribution for one scan -----------------------
 
@@ -770,6 +812,89 @@ class DataTab(QWidget):
         ax.tick_params(colors="#cdd6f4")
         for spine in ax.spines.values():
             spine.set_edgecolor("#45475a")
+        self.fig_ts.tight_layout()
+        self.canvas_ts.draw()
+        self.plot_tabs.setCurrentIndex(1)
+
+    def _draw_ts_with_fit(self, x, y, ylabel, title, med_diff_curve=None):
+        """Plot raw curve + smooth fit (D₂-regularized) + residuals."""
+        from modules.algo.optimisation import BFGSB
+
+        reg = self.spn_reg.value()
+        n   = len(y)
+
+        if n < 3:
+            self._draw_ts_scan(x, y, "Scan index", ylabel, title)
+            return
+
+        # Second-order difference operator D: (n-2) x n
+        D             = np.zeros((n - 2, n))
+        idx           = np.arange(n - 2)
+        D[idx, idx]   =  1.0
+        D[idx, idx+1] = -2.0
+        D[idx, idx+2] =  1.0
+        DtD = D.T @ D
+        A   = np.eye(n) + reg * DtD   # Hessian/2 of the quadratic objective
+
+        def F(z):
+            r = y - z
+            return float(np.dot(r, r) + reg * np.dot(D @ z, D @ z))
+
+        def Fgrad(z):
+            return 2.0 * (A @ z - y)
+
+        X0     = np.maximum(y.copy(), 0.0)
+        H0     = np.eye(n)
+        lx     = np.zeros(n)
+        ux     = np.full(n, np.inf)
+
+        try:
+            result = BFGSB(X0, H0, F, Fgrad, lx, ux,
+                           alpha_min=0.0, alpha_max=1.0,
+                           n_iter=500, grad_tol=1e-6, path=False)
+            z = result.x
+        except Exception as e:
+            QMessageBox.warning(self, "Fit error", f"Optimizer failed:\n{e}")
+            self._draw_ts_scan(x, y, "Scan index", ylabel, title)
+            return
+
+        residuals = y - z
+
+        self.fig_ts.clear()
+        ax1 = self.fig_ts.add_subplot(2, 1, 1)
+        ax2 = self.fig_ts.add_subplot(2, 1, 2, sharex=ax1)
+
+        for ax in (ax1, ax2):
+            ax.set_facecolor("#181825")
+            ax.tick_params(colors="#cdd6f4")
+            for spine in ax.spines.values():
+                spine.set_edgecolor("#45475a")
+
+        ax1.plot(x, y, color="#89b4fa", linewidth=1.2, alpha=0.65, label="Raw")
+        ax1.plot(x, z, color="#f38ba8", linewidth=1.5, label="Smooth fit")
+        ax1.fill_between(x, y, alpha=0.15, color="#89b4fa")
+        leg = ax1.legend(framealpha=0.3)
+        leg.get_frame().set_facecolor("#313244")
+        leg.get_frame().set_edgecolor("#45475a")
+        for t in leg.get_texts():
+            t.set_color("#cdd6f4")
+        ax1.set_ylabel(ylabel, color="#cdd6f4")
+        ax1.set_title(f"{title}  (λ={reg:.3g})", color="#cdd6f4")
+
+        ax2.plot(x, residuals, color="#a6e3a1", linewidth=1.0, label="Residuals")
+        ax2.fill_between(x, residuals, alpha=0.2, color="#a6e3a1")
+        ax2.axhline(0, color="#6c7086", linewidth=0.8, linestyle="--")
+        if med_diff_curve is not None and len(med_diff_curve) > 0:
+            ax2.plot(x[1:], med_diff_curve, color="#fab387", linewidth=1.0,
+                     linestyle="-", label="median(Δ Dp-scan)")
+        leg2 = ax2.legend(framealpha=0.3, fontsize=9)
+        leg2.get_frame().set_facecolor("#313244")
+        leg2.get_frame().set_edgecolor("#45475a")
+        for t in leg2.get_texts():
+            t.set_color("#cdd6f4")
+        ax2.set_xlabel("Scan index", color="#cdd6f4")
+        ax2.set_ylabel("Residuals", color="#cdd6f4")
+
         self.fig_ts.tight_layout()
         self.canvas_ts.draw()
         self.plot_tabs.setCurrentIndex(1)
