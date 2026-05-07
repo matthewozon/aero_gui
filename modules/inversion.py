@@ -508,15 +508,18 @@ class KalmanFilterInversion(InversionMethod):
     def __init__(self, alpha: float = 0.9, beta: float = -0.1,
                  sig1: float = 1e6, sig2: float = 1e6, sig12: float = 0.0,
                  var_val: float = 1e6, r_min: float = 1.0,
-                 p0_diag_val: float = 100.0):
-        self.alpha      = alpha
-        self.beta       = beta
-        self.sig1       = sig1
-        self.sig2       = sig2
-        self.sig12      = sig12
-        self.var_val    = var_val
-        self.r_min      = r_min
+                 p0_diag_val: float = 100.0,
+                 use_reg: bool = False, reg_var: float = 1.0):
+        self.alpha       = alpha
+        self.beta        = beta
+        self.sig1        = sig1
+        self.sig2        = sig2
+        self.sig12       = sig12
+        self.var_val     = var_val
+        self.r_min       = r_min
         self.p0_diag_val = p0_diag_val
+        self.use_reg     = use_reg
+        self.reg_var     = reg_var
 
     def _build_Q(self, n: int) -> np.ndarray:
         from modules.algo.stochproc import covariance_second_order_process
@@ -532,6 +535,47 @@ class KalmanFilterInversion(InversionMethod):
         if min_eig <= 0:
             Q += (-min_eig + 1e-10 * max(np.trace(Q) / n, 1.0)) * np.eye(n)
         return Q
+
+    @staticmethod
+    def _build_D(n: int) -> np.ndarray:
+        """Second-order difference operator, shape (n-2, n). Rows are [1, -2, 1]."""
+        D   = np.zeros((n - 2, n))
+        idx = np.arange(n - 2)
+        D[idx, idx]     =  1.0
+        D[idx, idx + 1] = -2.0
+        D[idx, idx + 2] =  1.0
+        return D
+
+    def _augment_for_reg(self, A: np.ndarray, Y: np.ndarray, R0: np.ndarray,
+                         n_ch: int, n_dp: int):
+        """
+        Augment (A, Y, R0, update_R, cbs) with the second-order difference
+        operator D and pseudo-measurements of zero.
+
+        Returns (A_aug, Y_aug, R0_aug, update_R_aug, cbs_aug).
+        """
+        from modules.algo.kalman import make_linear_callbacks
+        D      = self._build_D(n_dp)          # (n_dp-2, n_dp)
+        n_reg  = n_dp - 2
+        n_aug  = n_ch + n_reg
+        A_aug  = np.vstack([A, D])            # (n_aug, n_dp)
+        Y_aug  = np.vstack([Y, np.zeros((n_reg, Y.shape[1]))])
+
+        R0_aug = np.zeros((n_aug, n_aug))
+        R0_aug[:n_ch, :n_ch] = R0
+        R0_aug[n_ch:, n_ch:] = self.reg_var * np.eye(n_reg)
+
+        r_min   = self.r_min
+        reg_var = self.reg_var
+
+        def update_R_aug(y_t, ws):
+            R = np.zeros((n_aug, n_aug))
+            R[:n_ch, :n_ch] = np.diag(np.maximum(y_t[:n_ch], r_min))
+            R[n_ch:, n_ch:] = reg_var * np.eye(n_reg)
+            return R
+
+        cbs_aug = make_linear_callbacks(np.eye(n_dp), A_aug)
+        return A_aug, Y_aug, R0_aug, update_R_aug, cbs_aug
 
     def _make_kf_args(self, n_dp: int, A: np.ndarray,
                       first_counts: np.ndarray, n_scans: int):
@@ -568,12 +612,15 @@ class KalmanFilterInversion(InversionMethod):
     def _run_series(self, A: np.ndarray, count_matrix: np.ndarray):
         """Run the forward filter and return the KFWorkspace."""
         from modules.algo.kalman import kalman_filter
-        n_scans, _ = count_matrix.shape
-        n_dp       = A.shape[1]
+        n_scans, n_ch = count_matrix.shape
+        n_dp          = A.shape[1]
         x0, P0_d, Q, R0, t_samp, cbs, update_R = self._make_kf_args(
             n_dp, A, count_matrix[0], n_scans
         )
-        return kalman_filter(x0, P0_d, Q, R0, count_matrix.T, t_samp, 1.0,
+        Y = count_matrix.T
+        if self.use_reg and n_dp >= 3:
+            _, Y, R0, update_R, cbs = self._augment_for_reg(A, Y, R0, n_ch, n_dp)
+        return kalman_filter(x0, P0_d, Q, R0, Y, t_samp, 1.0,
                              update_R=update_R, **cbs)
 
     def _extract_results(self, ws):
@@ -603,12 +650,15 @@ class KalmanSmootherInversion(KalmanFilterInversion):
     def _run_series(self, A: np.ndarray, count_matrix: np.ndarray):
         """Run forward filter + backward RTS smoother, return KFWorkspace."""
         from modules.algo.kalman import kalman_filter_smoother
-        n_scans, _ = count_matrix.shape
-        n_dp       = A.shape[1]
+        n_scans, n_ch = count_matrix.shape
+        n_dp          = A.shape[1]
         x0, P0_d, Q, R0, t_samp, cbs, update_R = self._make_kf_args(
             n_dp, A, count_matrix[0], n_scans
         )
-        return kalman_filter_smoother(x0, P0_d, Q, R0, count_matrix.T, t_samp, 1.0,
+        Y = count_matrix.T
+        if self.use_reg and n_dp >= 3:
+            _, Y, R0, update_R, cbs = self._augment_for_reg(A, Y, R0, n_ch, n_dp)
+        return kalman_filter_smoother(x0, P0_d, Q, R0, Y, t_samp, 1.0,
                                       update_R=update_R, **cbs)
 
     def _extract_results(self, ws):

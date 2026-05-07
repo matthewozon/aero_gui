@@ -25,7 +25,7 @@ import warnings
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QComboBox, QLabel, QFileDialog,
-    QGroupBox, QDoubleSpinBox, QSpinBox, QSplitter,
+    QGroupBox, QDoubleSpinBox, QSpinBox, QCheckBox, QSplitter,
     QTextEdit, QMessageBox, QTabWidget,
     QFrame, QSizePolicy, QScrollArea,
 )
@@ -142,6 +142,17 @@ class KalmanTab(QWidget):
         self.spn_r_min = self._dspin(1e-6, 1e9, 2.0, 4)
         Rl.addWidget(self.spn_r_min, 0, 1)
         left.addWidget(grp_R)
+
+        # Spatial regularization via D₂ augmentation
+        grp_reg = QGroupBox("Spatial Regularization  (D₂ augmentation)")
+        Regl = QGridLayout(grp_reg)
+        self.chk_reg = QCheckBox("Augment H with 2nd-order difference operator")
+        self.chk_reg.setChecked(False)
+        Regl.addWidget(self.chk_reg, 0, 0, 1, 2)
+        Regl.addWidget(QLabel("Regularization variance:"), 1, 0)
+        self.spn_reg_var = self._dspin(1e-12, 1e15, 1.0, 4)
+        Regl.addWidget(self.spn_reg_var, 1, 1)
+        left.addWidget(grp_reg)
 
         # Actions
         self.btn_run = QPushButton("Run Inversion")
@@ -296,6 +307,8 @@ class KalmanTab(QWidget):
             var_val     = self.spn_var_val.value(),
             r_min       = self.spn_r_min.value(),
             p0_diag_val = self.spn_p0.value(),
+            use_reg     = self.chk_reg.isChecked(),
+            reg_var     = self.spn_reg_var.value(),
         )
 
     # ------------------------------------------------------------------
@@ -409,10 +422,13 @@ class KalmanTab(QWidget):
         self._plot_results(dp_grid)
         self.plot_tabs.setCurrentIndex(1)
 
+        reg_note = (f"  D₂ reg: σ²={self.spn_reg_var.value():.3g}"
+                    if self.chk_reg.isChecked() else "  D₂ reg: off")
         self._log(
             f"[{self.cmb_method.currentText()}]  {n_scans} scans\n"
             f"  N ∈ [{N_ALL.min():.3g}, {N_ALL.max():.3g}]\n"
-            f"  std ∈ [{std_ALL.min():.3g}, {std_ALL.max():.3g}]"
+            f"  std ∈ [{std_ALL.min():.3g}, {std_ALL.max():.3g}]\n"
+            f"{reg_note}"
         )
         if self.main_window:
             self.main_window.set_status(
