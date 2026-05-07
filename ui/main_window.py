@@ -16,6 +16,7 @@ from modules.data_model import AerosolDataset
 from ui.tab_data import DataTab
 from ui.tab_model import ModelTab
 from ui.tab_inversion import InversionTab
+from ui.tab_kalman import KalmanTab
 from ui.tab_estimation import EstimationTab
 from ui.tab_simulation import SimulationTab
 
@@ -49,12 +50,14 @@ class MainWindow(QMainWindow):
         self.tab_data       = DataTab(self.dataset, self)
         self.tab_model      = ModelTab(self.dataset, self)
         self.tab_inversion  = InversionTab(self.dataset, self)
+        self.tab_kalman     = KalmanTab(self.dataset, self)
         self.tab_estimation = EstimationTab(self.dataset, self)
         self.tab_simulation = SimulationTab(self)
 
         self.tabs.addTab(self.tab_data,       "📁  Data")
         self.tabs.addTab(self.tab_model,      "⚙️  Measurement Model")
         self.tabs.addTab(self.tab_inversion,  "🔄  Inversion")
+        self.tabs.addTab(self.tab_kalman,     "〰️  Kalman")
         self.tabs.addTab(self.tab_estimation, "📐  Parameter Estimation")
         self.tabs.addTab(self.tab_simulation, "🌀  Simulation")
 

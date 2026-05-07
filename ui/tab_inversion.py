@@ -48,6 +48,7 @@ from matplotlib.figure import Figure
 from modules.data_model import AerosolDataset
 from modules.inversion import (
     INVERSION_METHODS, TikhonovInversion, AeroInvRegCP,
+    KalmanFilterInversion, KalmanSmootherInversion,
 )
 
 
@@ -92,6 +93,25 @@ _PARAM_DEFS = {
     ],
     # NNLS has no parameters
     "NNLS (non-negative least squares)": [],
+    # ── Kalman methods share the same parameter set ──────────────────
+    "Kalman Filter (identity model)": [
+        ("α (AR2 size-corr.):",  "spn_alpha",   "double", -1.0,  1.0,   0.9,  3),
+        ("β (AR2 size-corr.):",  "spn_beta",    "double", -1.0,  0.0,  -0.1,  3),
+        ("σ₁ (init. var [0]):",  "spn_sig1",    "double",  0.0,  1e12,  1e6,  2),
+        ("σ₂ (init. var [1]):",  "spn_sig2",    "double",  0.0,  1e12,  1e6,  2),
+        ("σ₁₂ (init. cov):",     "spn_sig12",   "double", -1e12, 1e12,  0.0,  2),
+        ("Variance / bin:",      "spn_var_val", "double",  1e-6,  1e15,  1e6,  2),
+        ("Min. count (R floor):","spn_r_min",   "double",  1e-6,  1e9,   1.0,  4),
+    ],
+    "Kalman Smoother – FIKS (identity model)": [
+        ("α (AR2 size-corr.):",  "spn_alpha",   "double", -1.0,  1.0,   0.9,  3),
+        ("β (AR2 size-corr.):",  "spn_beta",    "double", -1.0,  0.0,  -0.1,  3),
+        ("σ₁ (init. var [0]):",  "spn_sig1",    "double",  0.0,  1e12,  1e6,  2),
+        ("σ₂ (init. var [1]):",  "spn_sig2",    "double",  0.0,  1e12,  1e6,  2),
+        ("σ₁₂ (init. cov):",     "spn_sig12",   "double", -1e12, 1e12,  0.0,  2),
+        ("Variance / bin:",      "spn_var_val", "double",  1e-6,  1e15,  1e6,  2),
+        ("Min. count (R floor):","spn_r_min",   "double",  1e-6,  1e9,   1.0,  4),
+    ],
 }
 
 
@@ -337,6 +357,15 @@ class InversionTab(QWidget):
                        max_iter=p["spn_max_iter"].value(),
                        N_max=p["spn_N_max"].value(),
                        reg_scale=p["spn_reg"].value())
+        elif name in ("Kalman Filter (identity model)",
+                      "Kalman Smoother – FIKS (identity model)"):
+            return cls(alpha   = p["spn_alpha"].value(),
+                       beta    = p["spn_beta"].value(),
+                       sig1    = p["spn_sig1"].value(),
+                       sig2    = p["spn_sig2"].value(),
+                       sig12   = p["spn_sig12"].value(),
+                       var_val = p["spn_var_val"].value(),
+                       r_min   = p["spn_r_min"].value())
         # Quick estimate and NNLS have no parameters
         return cls()
 
@@ -431,7 +460,7 @@ class InversionTab(QWidget):
     def _run_all_scans(self, method, name, A, dp_grid):
         """Invert all scans; use aeroinv_reg's native warm-start if selected."""
         count_matrix = self._align_matrix(self.dataset.count_matrix, A.shape[0])
-        if name == "Chambolle-Pock / Gaussian (AeroInv)":
+        if hasattr(method, 'solve_series'):
             self.last_result = method.solve_series(A, count_matrix, dp_grid)
         else:
             results = []

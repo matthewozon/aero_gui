@@ -481,6 +481,152 @@ class AeroInvOzon2020(InversionMethod):
 
 
 # ============================================================
+#  Methods 10 & 11 – Kalman Filter / Smoother
+#  Evolution model : F = I  (identity)
+#  State covariance: Q = covariance_second_order_process(α, β, σ₁, σ₂, σ₁₂, var_val·1)
+#  Measurement noise: R_k = diag(max(y_k, r_min))  (Poisson, diagonal)
+# ============================================================
+
+class KalmanFilterInversion(InversionMethod):
+    """
+    Forward Extended Kalman Filter.
+
+    State-space model
+    -----------------
+    x_k = x_{k-1} + w_k ,   w_k ~ N(0, Q)
+    y_k = A x_k   + v_k ,   v_k ~ N(0, R_k)
+
+    Q is built from covariance_second_order_process (2nd-order AR in the
+    size dimension) with a constant variance vector var_val·ones(n_dp).
+
+    R_k is diagonal with entries max(y_k[i], r_min): Poisson noise
+    (variance ≈ count) with a numerical floor for stability.
+    """
+
+    name = "Kalman Filter (identity model)"
+
+    def __init__(self, alpha: float = 0.9, beta: float = -0.1,
+                 sig1: float = 1e6, sig2: float = 1e6, sig12: float = 0.0,
+                 var_val: float = 1e6, r_min: float = 1.0,
+                 p0_diag_val: float = 100.0):
+        self.alpha      = alpha
+        self.beta       = beta
+        self.sig1       = sig1
+        self.sig2       = sig2
+        self.sig12      = sig12
+        self.var_val    = var_val
+        self.r_min      = r_min
+        self.p0_diag_val = p0_diag_val
+
+    def _build_Q(self, n: int) -> np.ndarray:
+        from modules.algo.stochproc import covariance_second_order_process
+        import warnings
+        var_vec = np.full(n, self.var_val)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            Q = covariance_second_order_process(
+                self.alpha, self.beta, self.sig1, self.sig2, self.sig12, var_vec
+            )
+        Q = 0.5 * (Q + Q.T)
+        min_eig = np.linalg.eigvalsh(Q).min()
+        if min_eig <= 0:
+            Q += (-min_eig + 1e-10 * max(np.trace(Q) / n, 1.0)) * np.eye(n)
+        return Q
+
+    def _make_kf_args(self, n_dp: int, A: np.ndarray,
+                      first_counts: np.ndarray, n_scans: int):
+        """Build all arguments needed by kalman_filter / kalman_filter_smoother."""
+        from modules.algo.kalman import make_linear_callbacks
+        Q    = self._build_Q(n_dp)
+        R0   = np.diag(np.maximum(first_counts, self.r_min))
+        x0   = np.zeros(n_dp)
+        P0_d = np.full(n_dp, self.p0_diag_val)
+        cbs  = make_linear_callbacks(np.eye(n_dp), A)
+        r_min = self.r_min
+
+        def update_R(y_t, ws):
+            return np.diag(np.maximum(y_t, r_min))
+
+        t_samp = np.arange(n_scans, dtype=float)
+        return x0, P0_d, Q, R0, t_samp, cbs, update_R
+
+    def solve(self, A: np.ndarray, counts: np.ndarray,
+              dp_grid: np.ndarray) -> InversionResult:
+        from modules.algo.kalman import kalman_filter
+        n_dp = A.shape[1]
+        x0, P0_d, Q, R0, _, cbs, update_R = self._make_kf_args(
+            n_dp, A, counts, 1
+        )
+        Y  = counts[:, np.newaxis]
+        ws = kalman_filter(x0, P0_d, Q, R0, Y, np.array([0.0]), 1.0,
+                           update_R=update_R, **cbs)
+        N = np.maximum(ws.x_fil_all[:, 0], 0.0)
+        residual = np.linalg.norm(A @ N - counts) / (np.linalg.norm(counts) + 1e-30)
+        return InversionResult(N_retrieved=N, dp_grid=dp_grid, residual=residual,
+                               info={"log_likelihood": ws.log_likelihood})
+
+    def _run_series(self, A: np.ndarray, count_matrix: np.ndarray):
+        """Run the forward filter and return the KFWorkspace."""
+        from modules.algo.kalman import kalman_filter
+        n_scans, _ = count_matrix.shape
+        n_dp       = A.shape[1]
+        x0, P0_d, Q, R0, t_samp, cbs, update_R = self._make_kf_args(
+            n_dp, A, count_matrix[0], n_scans
+        )
+        return kalman_filter(x0, P0_d, Q, R0, count_matrix.T, t_samp, 1.0,
+                             update_R=update_R, **cbs)
+
+    def _extract_results(self, ws):
+        """Return (N_ALL, std_ALL) from a filter workspace, shape (n_scans, n_dp)."""
+        from modules.algo.kalman import filtered_states, filtered_stds
+        return np.maximum(filtered_states(ws), 0.0), filtered_stds(ws)
+
+    def solve_series(self, A: np.ndarray, count_matrix: np.ndarray,
+                     dp_grid: np.ndarray) -> np.ndarray:
+        """Return filtered distributions, shape (n_scans, n_dp)."""
+        ws = self._run_series(A, count_matrix)
+        N, _ = self._extract_results(ws)
+        return N
+
+
+class KalmanSmootherInversion(KalmanFilterInversion):
+    """
+    Extended Kalman Filter + Fixed Interval Kalman Smoother (RTS).
+
+    Same state-space model as KalmanFilterInversion; adds a backward
+    Rauch-Tung-Striebel pass over the full time series.  For a single
+    scan the smoother coincides with the filter.
+    """
+
+    name = "Kalman Smoother – FIKS (identity model)"
+
+    def _run_series(self, A: np.ndarray, count_matrix: np.ndarray):
+        """Run forward filter + backward RTS smoother, return KFWorkspace."""
+        from modules.algo.kalman import kalman_filter_smoother
+        n_scans, _ = count_matrix.shape
+        n_dp       = A.shape[1]
+        x0, P0_d, Q, R0, t_samp, cbs, update_R = self._make_kf_args(
+            n_dp, A, count_matrix[0], n_scans
+        )
+        return kalman_filter_smoother(x0, P0_d, Q, R0, count_matrix.T, t_samp, 1.0,
+                                      update_R=update_R, **cbs)
+
+    def _extract_results(self, ws):
+        """Return (N_ALL, std_ALL) from a smoother workspace, shape (n_scans, n_dp)."""
+        from modules.algo.kalman import smoothed_states, smoothed_stds
+        return np.maximum(smoothed_states(ws), 0.0), smoothed_stds(ws)
+
+    def solve_series(self, A: np.ndarray, count_matrix: np.ndarray,
+                     dp_grid: np.ndarray) -> np.ndarray:
+        """Return smoothed distributions, shape (n_scans, n_dp)."""
+        ws = self._run_series(A, count_matrix)
+        N, _ = self._extract_results(ws)
+        return N
+
+    # solve() is inherited from KalmanFilterInversion (filter for single step)
+
+
+# ============================================================
 #  Registry  – used by the GUI to populate the combo-box
 # ============================================================
 
@@ -491,7 +637,9 @@ INVERSION_METHODS = {
     EMInversion.name:           EMInversion,
     AeroInvQuick.name:          AeroInvQuick,
     AeroInvPrecondReg.name:     AeroInvPrecondReg,
-    AeroInvRegCP.name:          AeroInvRegCP,
-    AeroInvCPPoisson.name:      AeroInvCPPoisson,
-    AeroInvOzon2020.name:       AeroInvOzon2020,
+    AeroInvRegCP.name:              AeroInvRegCP,
+    AeroInvCPPoisson.name:          AeroInvCPPoisson,
+    AeroInvOzon2020.name:           AeroInvOzon2020,
+    KalmanFilterInversion.name:     KalmanFilterInversion,
+    KalmanSmootherInversion.name:   KalmanSmootherInversion,
 }

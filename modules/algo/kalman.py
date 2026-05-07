@@ -24,17 +24,25 @@ Improvements over the original
 2.  Optional symmetric enforcement  0.5*(P + P')  after each update,
     controlled by `enforce_symmetry` flag (default True).
 
-3.  Numerically robust Kalman gain: uses `np.linalg.solve` (LU
-    factorisation) instead of `pinv` when the innovation covariance is
-    square and well-conditioned; falls back to `pinv` otherwise.
+3.  Numerically robust Kalman gain: uses Cholesky factorisation of the
+    innovation covariance S (preferred for symmetric PD matrices); falls
+    back to `np.linalg.solve` then `pinv` for degenerate cases.
 
 4.  `log_likelihood` accumulation: the filter accumulates the Gaussian
     log-likelihood of the innovations at each step, useful for parameter
-    tuning.
+    tuning.  S is factored once and reused for both the Kalman gain and
+    the likelihood, avoiding the double computation present in the original.
 
 5.  Time-varying noise covariances (Q, R) and measurement operators (H)
     are handled via optional callable arguments, consistent with the
     original time_dep_* flags.
+
+6.  `apply_measurement` callable is now actually invoked to compute the
+    predicted observation, enabling genuinely nonlinear measurement models
+    in the EKF.
+
+7.  Pre-allocated identity matrix (_eye_x) and declared t_samp field in
+    KFWorkspace eliminate dynamic attribute injection and per-step alloc.
 
 Public API
 ----------
@@ -46,7 +54,7 @@ kalman_filter_smoother — KF + Fixed Interval Smoother (mirrors KF_FIS)
 from __future__ import annotations
 
 import numpy as np
-from numpy.linalg import pinv, solve
+from numpy.linalg import pinv
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple
 
@@ -87,6 +95,7 @@ class KFWorkspace:
     K:     np.ndarray = field(init=False)   # (n_x, n_y)  Kalman gain
     Q:     np.ndarray = field(init=False)   # (n_x, n_x)  process noise cov
     R:     np.ndarray = field(init=False)   # (n_y, n_y)  observation noise cov
+    _eye_x: np.ndarray = field(init=False)  # (n_x, n_x)  pre-allocated identity
 
     # --- time-series history ---
     x_fil_all: np.ndarray = field(init=False)   # (n_x, n_t)
@@ -97,6 +106,7 @@ class KFWorkspace:
     H_all:     np.ndarray = field(init=False)   # (n_y, n_x, n_t)
     Q_all:     np.ndarray = field(init=False)   # (n_x, n_x, n_t)
     R_all:     np.ndarray = field(init=False)   # (n_y, n_y, n_t)
+    t_samp:    Optional[np.ndarray] = field(init=False, default=None)  # (n_t,)
 
     # --- smoother output (filled by kalman_filter_smoother) ---
     x_smo_all: Optional[np.ndarray] = field(init=False, default=None)  # (n_x, n_t)
@@ -107,17 +117,18 @@ class KFWorkspace:
 
     def __post_init__(self):
         nx, ny, nt = self.n_x, self.n_y, self.n_t
-        self.x_fil = np.zeros(nx)
-        self.x_pre = np.zeros(nx)
-        self.P_fil = np.zeros((nx, nx))
-        self.P_pre = np.zeros((nx, nx))
-        self.y_pre = np.zeros(ny)
-        self.y_t   = np.zeros(ny)
-        self.F     = np.zeros((nx, nx))
-        self.H     = np.zeros((ny, nx))
-        self.K     = np.zeros((nx, ny))
-        self.Q     = np.zeros((nx, nx))
-        self.R     = np.zeros((ny, ny))
+        self.x_fil  = np.zeros(nx)
+        self.x_pre  = np.zeros(nx)
+        self.P_fil  = np.zeros((nx, nx))
+        self.P_pre  = np.zeros((nx, nx))
+        self.y_pre  = np.zeros(ny)
+        self.y_t    = np.zeros(ny)
+        self.F      = np.zeros((nx, nx))
+        self.H      = np.zeros((ny, nx))
+        self.K      = np.zeros((nx, ny))
+        self.Q      = np.zeros((nx, nx))
+        self.R      = np.zeros((ny, ny))
+        self._eye_x = np.eye(nx)              # pre-allocated; never modified in place
 
         self.x_fil_all = np.zeros((nx, nt))
         self.x_pre_all = np.zeros((nx, nt))
@@ -136,35 +147,71 @@ class KFWorkspace:
 
 def _prediction(ws: KFWorkspace,
                 apply_model: Callable,
+                apply_measurement: Callable,
                 dt: float) -> None:
     """
     Prediction step.
         x_pre = f(x_fil, dt)         [nonlinear propagation]
         P_pre = F P_fil F' + Q       [covariance propagation]
-        y_pre = H x_pre              [predicted observation, linear]
+        y_pre = h(x_pre, H)          [predicted observation via callable]
 
     Mirrors prediction!() in ekf_mod.jl.
     """
     ws.x_pre = apply_model(ws.x_fil, dt)
     ws.P_pre = ws.F @ ws.P_fil @ ws.F.T + ws.Q
-    ws.y_pre = ws.H @ ws.x_pre
+    ws.y_pre = apply_measurement(ws.x_pre, ws.H)
 
 
-def _kalman_gain(ws: KFWorkspace) -> None:
+def _gain_and_loglik(
+    ws: KFWorkspace,
+    compute_likelihood: bool,
+) -> float:
     """
-    Compute Kalman gain.
-        S   = H P_pre H' + R          [innovation covariance]
-        K   = P_pre H' S^{-1}
+    Compute Kalman gain and optionally the innovation log-likelihood.
 
-    Uses solve() for efficiency and numerical stability; falls back to
-    pinv for ill-conditioned S.  Mirrors kalman_gain() in ekf_mod.jl.
+        PHt = P_pre H'
+        S   = H PHt + R              [innovation covariance]
+        K   = PHt S^{-1}
+
+    PHt and S are computed once and shared between the gain and likelihood
+    calculations.  Uses Cholesky factorisation (O(n^3/3) vs O(n^3) for
+    general LU) when S is symmetric positive definite; falls back to pinv
+    for singular or ill-conditioned S.
+
+    Returns the log-likelihood contribution ℓ_k (0.0 if not requested or
+    if S is degenerate).
+
+    Replaces the previous separate _kalman_gain() and
+    _log_likelihood_contribution() functions, which both recomputed S.
     """
-    S = ws.H @ ws.P_pre @ ws.H.T + ws.R
+    PHt = ws.P_pre @ ws.H.T            # (n_x, n_y) — computed once
+    S   = ws.H @ PHt + ws.R            # (n_y, n_y)
+    v   = ws.y_t - ws.y_pre            # innovation
+
     try:
-        # K = P H' S^{-1}  ⟺  S K' = H P'  →  solve for K'
-        ws.K = np.linalg.solve(S.T, (ws.P_pre @ ws.H.T).T).T
+        L = np.linalg.cholesky(S)      # S = L L^T  (PD check implicit)
+
+        # K = PHt S^{-1}
+        # Solve: S K^T = H P_pre  <=>  L (L^T K^T) = PHt^T
+        tmp   = np.linalg.solve(L,   PHt.T)    # L^{-1} PHt^T : (n_y, n_x)
+        ws.K  = np.linalg.solve(L.T, tmp).T    # K             : (n_x, n_y)
+
+        if compute_likelihood:
+            logdet  = 2.0 * np.sum(np.log(np.diag(L)))
+            Sinv_v  = np.linalg.solve(L.T, np.linalg.solve(L, v))
+            return -0.5 * (ws.n_y * np.log(2.0 * np.pi) + logdet + v @ Sinv_v)
+
     except np.linalg.LinAlgError:
-        ws.K = ws.P_pre @ ws.H.T @ pinv(S)
+        # S is singular or not PD — fall back to pseudoinverse
+        Sinv = pinv(S)
+        ws.K = PHt @ Sinv
+
+        if compute_likelihood:
+            sign, logdet = np.linalg.slogdet(S)
+            if sign > 0:
+                return -0.5 * (ws.n_y * np.log(2.0 * np.pi) + logdet + v @ Sinv @ v)
+
+    return 0.0
 
 
 def _filtering(ws: KFWorkspace,
@@ -174,37 +221,20 @@ def _filtering(ws: KFWorkspace,
         x_fil = x_pre + K (y_t - y_pre)
         P_fil = (I - KH) P_pre (I - KH)' + K R K'    [Joseph form]
 
-    The Joseph form (improvement over the original Julia code) keeps
-    P_fil symmetric positive semi-definite in finite-precision arithmetic.
+    The Joseph form keeps P_fil symmetric positive semi-definite in
+    finite-precision arithmetic.  Uses the pre-allocated identity _eye_x
+    to avoid allocating np.eye(n_x) on every call.
+
     Mirrors filtering!() in ekf_mod.jl.
     """
     innovation = ws.y_t - ws.y_pre
     ws.x_fil   = ws.x_pre + ws.K @ innovation
 
-    I_KH   = np.eye(ws.n_x) - ws.K @ ws.H
+    I_KH     = ws._eye_x - ws.K @ ws.H
     ws.P_fil = I_KH @ ws.P_pre @ I_KH.T + ws.K @ ws.R @ ws.K.T
 
     if enforce_symmetry:
         ws.P_fil = 0.5 * (ws.P_fil + ws.P_fil.T)
-
-
-def _log_likelihood_contribution(ws: KFWorkspace) -> float:
-    """
-    Gaussian log-likelihood of the innovation:
-        ℓ = -½ [ k log(2π) + log|S| + v' S^{-1} v ]
-    where v = y_t - y_pre,  S = H P_pre H' + R.
-    """
-    v = ws.y_t - ws.y_pre
-    S = ws.H @ ws.P_pre @ ws.H.T + ws.R
-    ny = ws.n_y
-    sign, logdet = np.linalg.slogdet(S)
-    if sign <= 0:
-        return 0.0   # degenerate — skip this step
-    try:
-        Sinv_v = np.linalg.solve(S, v)
-    except np.linalg.LinAlgError:
-        Sinv_v = pinv(S) @ v
-    return -0.5 * (ny * np.log(2 * np.pi) + logdet + v @ Sinv_v)
 
 
 def _one_step_smoother(ws: KFWorkspace,
@@ -219,16 +249,27 @@ def _one_step_smoother(ws: KFWorkspace,
         x_smo_i = x_fil_i + G_i (x_smo_{i+1} - x_pre_{i+1})
         P_smo_i = P_fil_i + G_i (P_smo_{i+1} - P_pre_{i+1}) G_i'
 
+    F_all[:, :, i+1] is the EKF Jacobian linearised around x_fil_i and
+    stored at index i+1 during the forward pass (it propagates step i → i+1),
+    so using index i+1 here is intentional and correct.
+
+    Uses Cholesky factorisation of P_pre_{i+1} (which is PD in theory)
+    to compute the smoothing gain more stably than a plain solve.
+
     Mirrors one_step_fixed_interval() in ekf_mod.jl.
     """
-    P_fil_i  = ws.P_fil_all[:, :, i]
-    F_next   = ws.F_all[:, :, i + 1]
+    P_fil_i    = ws.P_fil_all[:, :, i]
+    F_next     = ws.F_all[:, :, i + 1]
     P_pre_next = ws.P_pre_all[:, :, i + 1]
 
     # Smoothing gain  G_i = P_fil_i F_{i+1}' P_pre_{i+1}^{-1}
-    # solve P_pre_{i+1} G_i' = F_{i+1} P_fil_i'  →  G_i' then transpose
+    # Equivalently:  P_pre_next G_i' = F_next P_fil_i  (P_fil_i symmetric)
     try:
-        G = np.linalg.solve(P_pre_next.T, (P_fil_i @ F_next.T).T).T
+        L_p = np.linalg.cholesky(P_pre_next)
+        rhs = F_next @ P_fil_i                       # (n_x, n_x)
+        tmp = np.linalg.solve(L_p,   rhs)            # L^{-1} rhs
+        Gt  = np.linalg.solve(L_p.T, tmp)            # G_i^T
+        G   = Gt.T
     except np.linalg.LinAlgError:
         G = P_fil_i @ F_next.T @ pinv(P_pre_next)
 
@@ -259,7 +300,7 @@ def kalman_filter(
     # --- problem-specific callables ---
     apply_model:          Callable,   # (x, dt) → x_new
     update_jacobian:      Callable,   # (x, dt, F) → F_new   (EKF Jacobian)
-    apply_measurement:    Callable,   # (x, H) → y_pred      (= H @ x for linear)
+    apply_measurement:    Callable,   # (x, H) → y_pred
     set_jacobian:         Callable,   # (x, dt, F) → F_init  (initial linearisation)
     set_meas_jacobian:    Callable,   # (H,) → H_init
     # --- optional time-varying overrides ---
@@ -289,7 +330,8 @@ def kalman_filter(
     t0              Time normalisation constant (same role as t0_ in Julia).
     apply_model     Callable (x, dt) → x_new.  The nonlinear state evolution.
     update_jacobian Callable (x, dt, F) → F_new.  Jacobian of apply_model at x.
-    apply_measurement Callable (x, H) → y_pred.  Usually just H @ x.
+    apply_measurement Callable (x, H) → y_pred.  The (possibly nonlinear)
+                    measurement model; called at every prediction step.
     set_jacobian    Callable (x, dt, F) → F.  Called once at initialisation.
     set_meas_jacobian Callable (H,) → H.  Called once at initialisation.
     update_Q        Optional callable (ws) → Q_new.  For time-varying Q.
@@ -309,8 +351,18 @@ def kalman_filter(
     n_y, n_t = Y.shape
     n_x = len(x0)
 
+    # -- input validation --
+    if len(P0_diag) != n_x:
+        raise ValueError(f"P0_diag length {len(P0_diag)} != n_x={n_x}")
+    if Q.shape != (n_x, n_x):
+        raise ValueError(f"Q shape {Q.shape} != ({n_x}, {n_x})")
+    if R.shape != (n_y, n_y):
+        raise ValueError(f"R shape {R.shape} != ({n_y}, {n_y})")
+    if len(t_samp) != n_t:
+        raise ValueError(f"t_samp length {len(t_samp)} != n_t={n_t}")
+
     ws = KFWorkspace(n_x=n_x, n_y=n_y, n_t=n_t)
-    ws.t_samp = t_samp.copy() if hasattr(t_samp, 'copy') else np.array(t_samp)
+    ws.t_samp = np.asarray(t_samp, dtype=float).copy()
 
     # -- initialise state and covariance --
     ws.x_fil = x0.copy()
@@ -319,7 +371,7 @@ def kalman_filter(
     ws.R     = R.copy()
 
     # -- initialise Jacobians (linearise around x0) --
-    dt_init = (t_samp[1] - t_samp[0]) / t0
+    dt_init = (t_samp[1] - t_samp[0]) / t0 if len(t_samp) > 1 else 1.0
     ws.F = set_jacobian(ws.x_fil, dt_init, ws.F.copy())
     ws.H = set_meas_jacobian(ws.H.copy())
 
@@ -343,15 +395,11 @@ def kalman_filter(
         if update_H is not None:
             ws.H = update_H(ws)
 
-        # prediction
-        _prediction(ws, apply_model, dt)
+        # prediction (uses apply_measurement for y_pre)
+        _prediction(ws, apply_model, apply_measurement, dt)
 
-        # likelihood (before filtering, uses y_pre from prediction)
-        if compute_likelihood:
-            ws.log_likelihood += _log_likelihood_contribution(ws)
-
-        # Kalman gain
-        _kalman_gain(ws)
+        # Kalman gain + log-likelihood (S factored once, shared between both)
+        ws.log_likelihood += _gain_and_loglik(ws, compute_likelihood)
 
         # filtering (analysis)
         _filtering(ws, enforce_symmetry=enforce_symmetry)
