@@ -38,13 +38,20 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from matplotlib.figure import Figure
 
 from modules.data_model import AerosolDataset
-from modules.inversion import KalmanFilterInversion, KalmanSmootherInversion
+from modules.inversion import (
+    KalmanFilterInversion, KalmanSmootherInversion,
+    GDEKalmanInversion, GDEKalmanSmootherInversion,
+)
 
 
 _METHODS = {
     "Kalman Filter":          KalmanFilterInversion,
     "Kalman Smoother (FIKS)": KalmanSmootherInversion,
+    "GDE-EKF":                GDEKalmanInversion,
+    "GDE-FIKS":               GDEKalmanSmootherInversion,
 }
+
+_GDE_METHODS = {"GDE-EKF", "GDE-FIKS"}
 
 
 class KalmanTab(QWidget):
@@ -57,6 +64,7 @@ class KalmanTab(QWidget):
         self._last_A      = None
         self._last_counts = None
         self._scan_offset = 0       # first absolute scan index of the last run
+        self._last_gde    = None    # GDEResult from a GDE run
 
         self._build_ui()
 
@@ -97,6 +105,7 @@ class KalmanTab(QWidget):
         mml = QVBoxLayout(grp_meth)
         self.cmb_method = QComboBox()
         self.cmb_method.addItems(list(_METHODS.keys()))
+        self.cmb_method.currentTextChanged.connect(self._on_method_changed)
         mml.addWidget(self.cmb_method)
         left.addWidget(grp_meth)
 
@@ -185,6 +194,62 @@ class KalmanTab(QWidget):
         Regl.addWidget(self.spn_reg_var, 1, 1)
         left.addWidget(grp_reg)
 
+        # GDE parameters (shown only when a GDE method is selected)
+        grp_gde = QGroupBox("GDE Parameters")
+        self.grp_gde = grp_gde
+        Gl = QGridLayout(grp_gde)
+
+        def _grow(lo, hi, val, dec):
+            return self._dspin(lo, hi, val, dec)
+
+        Gl.addWidget(QLabel("Scan duration (s):"),  0, 0)
+        self.spn_dt_scan = _grow(0.1, 1e6,   60.0, 2);  Gl.addWidget(self.spn_dt_scan, 0, 1)
+        Gl.addWidget(QLabel("Temperature (K):"),     1, 0)
+        self.spn_T  = _grow(200.0, 400.0, 293.15, 2);  Gl.addWidget(self.spn_T, 1, 1)
+        Gl.addWidget(QLabel("Pressure (Pa):"),        2, 0)
+        self.spn_P  = _grow(1e3,  2e5, 1.013e5, 1); Gl.addWidget(self.spn_P, 2, 1)
+        Gl.addWidget(QLabel("Density (kg/m³):"),      3, 0)
+        self.spn_rho = _grow(100, 3000, 1400.0, 1); Gl.addWidget(self.spn_rho, 3, 1)
+
+        Gl.addWidget(QLabel("Mechanisms:"), 4, 0, 1, 2)
+        self.chk_gde_con = QCheckBox("Condensation/growth");  self.chk_gde_con.setChecked(True)
+        self.chk_gde_nuc = QCheckBox("Nucleation");            self.chk_gde_nuc.setChecked(True)
+        self.chk_gde_los = QCheckBox("Wall loss");             self.chk_gde_los.setChecked(True)
+        self.chk_gde_coa = QCheckBox("Coagulation");           self.chk_gde_coa.setChecked(False)
+        Gl.addWidget(self.chk_gde_con, 5, 0, 1, 2)
+        Gl.addWidget(self.chk_gde_nuc, 6, 0, 1, 2)
+        Gl.addWidget(self.chk_gde_los, 7, 0, 1, 2)
+        Gl.addWidget(self.chk_gde_coa, 8, 0, 1, 2)
+
+        Gl.addWidget(QLabel("GR₀ (m/s):"),          9, 0)
+        self.spn_GR0 = _grow(1e-13, 1e-6, 1e-9, 12); Gl.addWidget(self.spn_GR0, 9, 1)
+        Gl.addWidget(QLabel("J₀ (#/(m³·s)):"),      10, 0)
+        self.spn_J0  = _grow(1e-3, 1e15,  1e6, 2);  Gl.addWidget(self.spn_J0, 10, 1)
+        Gl.addWidget(QLabel("γ₀ (1/s):"),           11, 0)
+        self.spn_gamma0 = _grow(1e-6, 10.0, 1e-3, 6); Gl.addWidget(self.spn_gamma0, 11, 1)
+
+        Gl.addWidget(QLabel("σ²_GR (log-GR var):"), 12, 0)
+        self.spn_var_GR = _grow(1e-12, 1e6, 1e-4, 8); Gl.addWidget(self.spn_var_GR, 12, 1)
+        Gl.addWidget(QLabel("σ²_J (log-J var):"),   13, 0)
+        self.spn_var_J  = _grow(1e-12, 1e6, 1e-4, 8); Gl.addWidget(self.spn_var_J, 13, 1)
+        Gl.addWidget(QLabel("σ²_ξ (log-ξ var):"),   14, 0)
+        self.spn_var_xi = _grow(1e-12, 1e6, 1e-8, 8); Gl.addWidget(self.spn_var_xi, 14, 1)
+
+        Gl.addWidget(QLabel("log ζ₀ (init. log-GR):"), 15, 0)
+        self.spn_log_GR_init = _grow(-30, 30, 0.0, 3); Gl.addWidget(self.spn_log_GR_init, 15, 1)
+        Gl.addWidget(QLabel("log j₀ (init. log-J):"),  16, 0)
+        self.spn_log_J_init  = _grow(-30, 30, 0.0, 3); Gl.addWidget(self.spn_log_J_init, 16, 1)
+
+        Gl.addWidget(QLabel("P₀ diag (GR):"),  17, 0)
+        self.spn_p0_GR = _grow(1e-6, 1e9, 4.0, 3); Gl.addWidget(self.spn_p0_GR, 17, 1)
+        Gl.addWidget(QLabel("P₀ diag (J):"),   18, 0)
+        self.spn_p0_J  = _grow(1e-6, 1e9, 4.0, 3); Gl.addWidget(self.spn_p0_J, 18, 1)
+        Gl.addWidget(QLabel("P₀ diag (ξ):"),   19, 0)
+        self.spn_p0_xi = _grow(1e-6, 1e9, 4.0, 3); Gl.addWidget(self.spn_p0_xi, 19, 1)
+
+        grp_gde.setVisible(False)
+        left.addWidget(grp_gde)
+
         # Actions
         self.btn_run = QPushButton("Run Inversion")
         self.btn_run.clicked.connect(self._run_inversion)
@@ -250,9 +315,20 @@ class KalmanTab(QWidget):
         dist_layout.addWidget(self.toolbar_1d)
         dist_layout.addWidget(self.canvas_1d)
 
+        # Sub-tab 4: GDE Results (4-panel)
+        gde_widget = QWidget()
+        gde_layout = QVBoxLayout(gde_widget)
+        self.fig_gde    = Figure(figsize=(6, 9), facecolor="#1e1e2e")
+        self.canvas_gde = FigureCanvas(self.fig_gde)
+        self.canvas_gde.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.toolbar_gde = NavigationToolbar(self.canvas_gde, self)
+        gde_layout.addWidget(self.toolbar_gde)
+        gde_layout.addWidget(self.canvas_gde)
+
         self.plot_tabs.addTab(q_widget,    "Process Covariance Q")
         self.plot_tabs.addTab(res_widget,  "Inversion Results")
         self.plot_tabs.addTab(dist_widget, "1D Size Distribution")
+        self.plot_tabs.addTab(gde_widget,  "GDE Results")
         right_layout.addWidget(self.plot_tabs)
 
         # Splitter
@@ -372,6 +448,13 @@ class KalmanTab(QWidget):
         return None, None
 
     # ------------------------------------------------------------------
+    # Method switching
+    # ------------------------------------------------------------------
+
+    def _on_method_changed(self, name: str):
+        self.grp_gde.setVisible(name in _GDE_METHODS)
+
+    # ------------------------------------------------------------------
     # Build method instance
     # ------------------------------------------------------------------
 
@@ -388,6 +471,35 @@ class KalmanTab(QWidget):
             p0_diag_val = self.spn_p0.value(),
             use_reg     = self.chk_reg.isChecked(),
             reg_var     = self.spn_reg_var.value(),
+        )
+
+    def _make_gde_method(self):
+        cls = _METHODS[self.cmb_method.currentText()]
+        return cls(
+            temperature      = self.spn_T.value(),
+            pressure         = self.spn_P.value(),
+            density          = self.spn_rho.value(),
+            use_coagulation  = self.chk_gde_coa.isChecked(),
+            use_condensation = self.chk_gde_con.isChecked(),
+            use_nucleation   = self.chk_gde_nuc.isChecked(),
+            use_wall_loss    = self.chk_gde_los.isChecked(),
+            GR0              = self.spn_GR0.value(),
+            J0               = self.spn_J0.value(),
+            gamma0           = self.spn_gamma0.value(),
+            t0               = self.spn_dt_scan.value(),
+            x0               = 1e6,
+            var_N            = self.spn_var_val.value(),
+            var_GR           = self.spn_var_GR.value(),
+            var_J            = self.spn_var_J.value(),
+            var_xi           = self.spn_var_xi.value(),
+            log_GR_init      = self.spn_log_GR_init.value(),
+            log_J_init       = self.spn_log_J_init.value(),
+            r_min            = self.spn_r_min.value(),
+            p0_N             = self.spn_p0.value(),
+            p0_GR            = self.spn_p0_GR.value(),
+            p0_J             = self.spn_p0_J.value(),
+            p0_xi            = self.spn_p0_xi.value(),
+            dt_scan          = self.spn_dt_scan.value(),
         )
 
     # ------------------------------------------------------------------
@@ -481,12 +593,53 @@ class KalmanTab(QWidget):
                                 f"Start scan ({start}) must be ≤ end scan ({end}).")
             return
         full_matrix  = self.dataset.count_matrix[start:end + 1]
-        method       = self._make_method()
         count_matrix = self._align_matrix(full_matrix, A.shape[0])
+        self._scan_offset = start
+        range_note = (f"scans {start}–{end}"
+                      if (start > 0 or end < self.dataset.n_scans - 1)
+                      else f"all {count_matrix.shape[0]} scans")
 
+        meth_name = self.cmb_method.currentText()
+
+        # ── GDE path ──────────────────────────────────────────────────────────
+        if meth_name in _GDE_METHODS:
+            method = self._make_gde_method()
+            try:
+                gde = method.solve_series(A, count_matrix, dp_grid)
+            except Exception as e:
+                QMessageBox.critical(self, "GDE inversion error", str(e))
+                return
+
+            self._last_gde    = gde
+            self.last_result  = gde.N_all
+            self._last_std    = gde.std_N
+            self._last_A      = A
+            self._last_counts = count_matrix
+
+            n_scans = gde.N_all.shape[0]
+            self.spn_scan_idx.setMaximum(n_scans - 1)
+            self.spn_scan_idx.setValue(0)
+
+            self._plot_gde_results(dp_grid)
+            self.plot_tabs.setCurrentIndex(3)   # GDE Results tab
+
+            self._log(
+                f"[{meth_name}]  {range_note}\n"
+                f"  N ∈ [{gde.N_all.min():.3g}, {gde.N_all.max():.3g}]\n"
+                f"  GR ∈ [{gde.GR_all.min():.3g}, {gde.GR_all.max():.3g}] m/s\n"
+                f"  J ∈ [{gde.J_all.min():.3g}, {gde.J_all.max():.3g}] #/(m³·s)"
+            )
+            if self.main_window:
+                self.main_window.set_status(
+                    f"GDE-EKF inversion complete — {range_note}."
+                )
+            return
+
+        # ── Identity Kalman path ──────────────────────────────────────────────
+        method = self._make_method()
         try:
             ws            = method._run_series(A, count_matrix)
-            N_ALL, std_ALL = method._extract_results(ws)  # (n_scans, n_dp) each
+            N_ALL, std_ALL = method._extract_results(ws)
         except Exception as e:
             QMessageBox.critical(self, "Inversion error", str(e))
             return
@@ -495,28 +648,20 @@ class KalmanTab(QWidget):
         self._last_std    = std_ALL
         self._last_A      = A
         self._last_counts = count_matrix
-        self._scan_offset = start
 
-        # Keep scan spinbox in range (relative to the selected sub-range)
         n_scans = N_ALL.shape[0]
         self.spn_scan_idx.setMaximum(n_scans - 1)
         self.spn_scan_idx.setValue(0)
 
-        # Refresh Q plot with the actual Q used
         Q = method._build_Q(A.shape[1])
         self._plot_Q(Q, dp_grid)
-
-        # Render results and switch to that sub-tab
         self._plot_results(dp_grid)
         self.plot_tabs.setCurrentIndex(1)
 
-        range_note = (f"scans {start}–{end}"
-                      if (start > 0 or end < self.dataset.n_scans - 1)
-                      else f"all {n_scans} scans")
         reg_note = (f"  D₂ reg: σ²={self.spn_reg_var.value():.3g}"
                     if self.chk_reg.isChecked() else "  D₂ reg: off")
         self._log(
-            f"[{self.cmb_method.currentText()}]  {range_note}\n"
+            f"[{meth_name}]  {range_note}\n"
             f"  N ∈ [{N_ALL.min():.3g}, {N_ALL.max():.3g}]\n"
             f"  std ∈ [{std_ALL.min():.3g}, {std_ALL.max():.3g}]\n"
             f"{reg_note}"
@@ -573,6 +718,70 @@ class KalmanTab(QWidget):
     # ------------------------------------------------------------------
     # Result plots
     # ------------------------------------------------------------------
+
+    def _plot_gde_results(self, dp_grid: np.ndarray):
+        """4-panel GDE result display: N heatmap, GR heatmap, J(t), xi(Dp) slices."""
+        gde    = self._last_gde
+        times  = np.arange(gde.N_all.shape[0]) + self._scan_offset
+        dp_m   = dp_grid * 1e-9   # nm → m for GR scale context
+
+        self.fig_gde.clear()
+        ax1 = self.fig_gde.add_subplot(4, 1, 1)
+        ax2 = self.fig_gde.add_subplot(4, 1, 2)
+        ax3 = self.fig_gde.add_subplot(4, 1, 3)
+        ax4 = self.fig_gde.add_subplot(4, 1, 4)
+        for ax in (ax1, ax2, ax3, ax4):
+            self._style_ax(ax)
+
+        # ── N(Dp, t) ─────────────────────────────────────────────────────────
+        im1 = ax1.pcolormesh(times, dp_grid, gde.N_all.T,
+                              cmap="viridis", shading="auto")
+        ax1.set_yscale("log")
+        cb1 = self.fig_gde.colorbar(im1, ax=ax1)
+        cb1.ax.tick_params(colors="#cdd6f4")
+        cb1.set_label("dN/dlogDp", color="#cdd6f4")
+        ax1.set_ylabel("Dp (nm)", color="#cdd6f4")
+        ax1.set_title("Retrieved N(Dp, t)  [GDE-EKF]", color="#cdd6f4")
+
+        # ── GR(Dp, t) in nm/h ────────────────────────────────────────────────
+        GR_nmh = gde.GR_all * 1e9 * 3600.0   # m/s → nm/h
+        im2 = ax2.pcolormesh(times, dp_grid, GR_nmh.T,
+                              cmap="plasma", shading="auto")
+        ax2.set_yscale("log")
+        cb2 = self.fig_gde.colorbar(im2, ax=ax2)
+        cb2.ax.tick_params(colors="#cdd6f4")
+        cb2.set_label("GR (nm/h)", color="#cdd6f4")
+        ax2.set_ylabel("Dp (nm)", color="#cdd6f4")
+        ax2.set_title("Growth rate GR(Dp, t)", color="#cdd6f4")
+
+        # ── J(t) nucleation rate ─────────────────────────────────────────────
+        ax3.plot(times, gde.J_all, color="#a6e3a1", linewidth=1.2)
+        ax3.fill_between(times, gde.J_all, alpha=0.2, color="#a6e3a1")
+        ax3.set_ylabel("J (#/(m³·s))", color="#cdd6f4")
+        ax3.set_title("Nucleation rate J(t)", color="#cdd6f4")
+        ax3.set_yscale("log")
+
+        # ── xi(Dp) wall loss — a few time slices ────────────────────────────
+        n_slices = min(5, len(times))
+        slice_idx = np.round(np.linspace(0, len(times) - 1, n_slices)).astype(int)
+        colors = ["#89b4fa", "#f38ba8", "#a6e3a1", "#fab387", "#cba6f7"]
+        for k, (si, col) in enumerate(zip(slice_idx, colors)):
+            abs_idx = int(times[si])
+            ax4.plot(dp_grid, gde.xi_all[si], color=col, linewidth=1.0,
+                     label=f"scan {abs_idx}")
+        ax4.set_xscale("log")
+        ax4.set_yscale("log")
+        ax4.set_xlabel("Dp (nm)", color="#cdd6f4")
+        ax4.set_ylabel("ξ (1/s)", color="#cdd6f4")
+        ax4.set_title("Wall-loss rate ξ(Dp) — time slices", color="#cdd6f4")
+        leg4 = ax4.legend(framealpha=0.3, fontsize=8)
+        leg4.get_frame().set_facecolor("#313244")
+        leg4.get_frame().set_edgecolor("#45475a")
+        for t in leg4.get_texts():
+            t.set_color("#cdd6f4")
+
+        self.fig_gde.tight_layout()
+        self.canvas_gde.draw()
 
     def _style_ax(self, ax):
         ax.set_facecolor("#181825")

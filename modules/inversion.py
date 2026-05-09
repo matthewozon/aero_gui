@@ -677,6 +677,292 @@ class KalmanSmootherInversion(KalmanFilterInversion):
 
 
 # ============================================================
+#  GDE result container
+# ============================================================
+
+@dataclass
+class GDEResult:
+    """Output of GDEKalmanInversion.solve_series()."""
+    N_all:  np.ndarray   # (n_t, n_dp)          dN/dlogDp
+    GR_all: np.ndarray   # (n_t, n_dp)  [m/s]   growth rate
+    J_all:  np.ndarray   # (n_t,)  [#/(m³·s)]   nucleation rate
+    xi_all: np.ndarray   # (n_t, n_dp)  [1/s]   wall-loss rate
+    std_N:  np.ndarray   # (n_t, n_dp)           posterior std of N
+
+
+# ============================================================
+#  Methods 12 & 13 – GDE Extended Kalman Filter / Smoother
+# ============================================================
+
+class GDEKalmanInversion:
+    """
+    EKF with one Euler step of the discretised GDE as the evolution model.
+
+    Augmented state  s ∈ ℝ^{3n+1}   (n = number of diameter bins)
+    ─────────────────────────────────────────────────────────────────
+    s[0:n]    = N       size distribution (dN/dlogDp)
+    s[n:2n]   = log ζ   log of dimensionless growth rate, per bin
+    s[2n]     = log j   log of dimensionless nucleation rate
+    s[2n+1:]  = log ξ   log of wall-loss rate [1/s], per bin
+
+    Evolution (EKF)
+    ---------------
+    N_new     = GDE_Euler(N, Δt; exp(log ζ), exp(log j), exp(log ξ))
+    log ζ_new = log ζ  + w_GR   (slow random walk → temporal smoothness)
+    log j_new = log j  + w_J
+    log ξ_new = log ξ  + w_xi   (near-zero noise → quasi-constant wall loss)
+
+    Measurement
+    -----------
+    y_k = A · N_k + v_k    H_aug = [A | 0 | 0 | 0]
+
+    The EKF Jacobian ∂s_new/∂s is computed analytically:
+      • ∂N_new/∂N    via jacobian_GDE()
+      • ∂N_new/∂logζ via the upwind condensation flux formula
+      • ∂N_new/∂logj via the nucleation source formula
+      • ∂N_new/∂logξ via the wall-loss formula
+      • All parameter–parameter blocks = I  (random walk)
+    """
+
+    name = "GDE-EKF (aerosol dynamics)"
+
+    def __init__(
+        self,
+        temperature: float = 293.15,
+        pressure:    float = 1.013e5,
+        density:     float = 1400.0,
+        use_coagulation:  bool = False,
+        use_condensation: bool = True,
+        use_nucleation:   bool = True,
+        use_wall_loss:    bool = True,
+        GR0:    float = 1e-9,
+        J0:     float = 1e6,
+        gamma0: float = 1e-3,
+        t0:     float = 60.0,
+        x0:     float = 1e6,
+        var_N:   float = 1e4,
+        var_GR:  float = 1e-4,
+        var_J:   float = 1e-4,
+        var_xi:  float = 1e-8,
+        log_GR_init: float = 0.0,
+        log_J_init:  float = 0.0,
+        r_min:   float = 1.0,
+        p0_N:    float = 1e4,
+        p0_GR:   float = 4.0,
+        p0_J:    float = 4.0,
+        p0_xi:   float = 4.0,
+        dt_scan: float = 60.0,
+    ):
+        self.temperature = temperature
+        self.pressure    = pressure
+        self.density     = density
+        self.use_coagulation  = use_coagulation
+        self.use_condensation = use_condensation
+        self.use_nucleation   = use_nucleation
+        self.use_wall_loss    = use_wall_loss
+        self.GR0 = GR0;  self.J0 = J0
+        self.gamma0 = gamma0;  self.t0 = t0;  self.x0 = x0
+        self.var_N  = var_N;   self.var_GR = var_GR
+        self.var_J  = var_J;   self.var_xi = var_xi
+        self.log_GR_init = log_GR_init
+        self.log_J_init  = log_J_init
+        self.r_min = r_min
+        self.p0_N  = p0_N;  self.p0_GR = p0_GR
+        self.p0_J  = p0_J;  self.p0_xi = p0_xi
+        self.dt_scan = dt_scan
+
+    # ── AeroSys ──────────────────────────────────────────────────────────────
+
+    def _setup_ws(self, dp_nm: np.ndarray):
+        """Create AeroSys, compute coagulation once; return (ws, log_xi_default)."""
+        from modules.algo.gde import (
+            AeroSys, coagulation_coefficient,
+            init_coagulation_indices, wall_deposition_rate,
+        )
+        d_m = np.asarray(dp_nm, dtype=float) * 1e-9
+        ws = AeroSys.from_diameters(
+            d_m,
+            beta_c=1e-15,
+            GR_c=self.GR0, J_c=self.J0, gamma_c=self.gamma0,
+            t_c=self.t0, x_c=self.x0,
+        )
+        ws.is_coa      = self.use_coagulation
+        ws.is_coa_gain = self.use_coagulation
+        ws.is_con      = self.use_condensation
+        ws.is_nuc      = self.use_nucleation
+        ws.is_los      = self.use_wall_loss
+        if self.use_coagulation:
+            coagulation_coefficient(ws, self.temperature, self.pressure, self.density)
+            init_coagulation_indices(ws)
+        log_xi0 = np.log(np.maximum(wall_deposition_rate(ws), 1e-30))
+        return ws, log_xi0
+
+    # ── Process noise ─────────────────────────────────────────────────────────
+
+    def _build_Q_aug(self, n: int) -> np.ndarray:
+        Q = np.zeros((3*n+1, 3*n+1))
+        Q[:n,     :n]      = self.var_N   * np.eye(n)
+        Q[n:2*n,  n:2*n]   = self.var_GR  * np.eye(n)
+        Q[2*n,    2*n]     = self.var_J
+        Q[2*n+1:, 2*n+1:]  = self.var_xi  * np.eye(n)
+        return Q
+
+    # ── EKF callbacks ────────────────────────────────────────────────────────
+
+    def _make_callbacks(self, ws, n: int) -> dict:
+        from modules.algo.gde import iter as gde_iter, jacobian_GDE
+        dt_scan = self.dt_scan
+
+        def _unpack(s):
+            return s[:n], s[n:2*n], float(s[2*n]), s[2*n+1:]
+
+        def _safe_exp(u):
+            return np.exp(np.clip(u, -50.0, 50.0))
+
+        def apply_model(s, _dt):
+            N, u_GR, u_J, u_xi = _unpack(s)
+            GR = _safe_exp(u_GR)
+            J  = float(_safe_exp(np.array([u_J]))[0])
+            xi = _safe_exp(u_xi)
+            Nn = gde_iter(ws, np.maximum(N, 0.0), dt_scan, GR, J, xi)
+            return np.concatenate([Nn, u_GR, [u_J], u_xi])
+
+        def update_jacobian(s, _dt, _F_old):
+            N, u_GR, u_J, u_xi = _unpack(s)
+            GR = _safe_exp(u_GR)
+            J  = float(_safe_exp(np.array([u_J]))[0])
+            xi = _safe_exp(u_xi)
+            Ns  = np.maximum(N, 0.0)
+            fac = dt_scan / ws.t0   # (dt_scan/t0) factor from Euler step
+
+            F = np.eye(3*n + 1)
+
+            # ∂N_new / ∂N  (GDE Jacobian, analytical)
+            F[:n, :n] = jacobian_GDE(ws, Ns, dt_scan, GR, xi)
+
+            # ∂N_new / ∂log_GR  (condensation, positive branch)
+            if ws.is_con:
+                # GR_arr[k] = (GR0·t0/d0)·exp(u_GR[k])
+                # ∂dx_con[s]/∂u_GR[k] = ∂dx_con[s]/∂GR_arr[k] · GR_arr[k]
+                ga = (ws.GR0 * ws.t0 / ws.d0) * GR          # GR_arr
+                diag_ = -ws.scale_GR * Ns * ga
+                sub_  =  ws.scale_GR[:-1] * ws.cst_r * Ns[:-1] * ga[:-1]
+                F[:n, n:2*n] = fac * (np.diag(diag_) + np.diag(sub_, -1))
+
+            # ∂N_new[0] / ∂log_J  (nucleation, only smallest bin)
+            if ws.is_nuc:
+                F[0, 2*n] = fac * (ws.J0 * ws.t0 / ws.x0) * J
+
+            # ∂N_new / ∂log_xi  (wall loss, diagonal block)
+            if ws.is_los:
+                rows = np.arange(n)
+                cols = np.arange(2*n + 1, 3*n + 1)
+                F[rows, cols] = fac * (-(ws.gamma0 * ws.t0)) * xi * Ns
+
+            return F
+
+        def apply_measurement(s, H):
+            return H @ s
+
+        def set_jacobian(s, dt, _F):
+            return update_jacobian(s, dt, None)
+
+        def set_meas_jacobian(_H):
+            return _H   # H_aug injected from solve_series
+
+        return dict(
+            apply_model=apply_model,
+            update_jacobian=update_jacobian,
+            apply_measurement=apply_measurement,
+            set_jacobian=set_jacobian,
+            set_meas_jacobian=set_meas_jacobian,
+        )
+
+    # ── Main entry point ──────────────────────────────────────────────────────
+
+    def solve_series(
+        self,
+        A:            np.ndarray,
+        count_matrix: np.ndarray,
+        dp_grid:      np.ndarray,
+        use_smoother: bool = False,
+    ) -> GDEResult:
+        from modules.algo.kalman import (
+            kalman_filter, kalman_filter_smoother,
+            filtered_states, filtered_stds,
+            smoothed_states, smoothed_stds,
+        )
+        n_t, n_ch = count_matrix.shape
+        n_dp      = A.shape[1]
+
+        ws, log_xi0 = self._setup_ws(dp_grid)
+
+        x0_aug = np.concatenate([
+            np.zeros(n_dp),
+            np.full(n_dp, self.log_GR_init),
+            [self.log_J_init],
+            log_xi0,
+        ])
+
+        H_aug = np.zeros((n_ch, 3*n_dp + 1))
+        H_aug[:, :n_dp] = A
+
+        Q_aug = self._build_Q_aug(n_dp)
+        P0_diag = np.concatenate([
+            np.full(n_dp, self.p0_N),
+            np.full(n_dp, self.p0_GR),
+            [self.p0_J],
+            np.full(n_dp, self.p0_xi),
+        ])
+
+        r_min = self.r_min
+        R0    = np.diag(np.maximum(count_matrix[0], r_min))
+
+        def update_R(y_t, _ws):
+            return np.diag(np.maximum(y_t, r_min))
+
+        cbs = self._make_callbacks(ws, n_dp)
+        H_fixed = H_aug
+
+        def set_meas_jac(_H):
+            return H_fixed
+
+        cbs["set_meas_jacobian"] = set_meas_jac
+
+        kf_fn = kalman_filter_smoother if use_smoother else kalman_filter
+        kf_ws = kf_fn(
+            x0=x0_aug, P0_diag=P0_diag, Q=Q_aug, R=R0,
+            Y=count_matrix.T, t_samp=np.arange(n_t, dtype=float), t0=1.0,
+            update_R=update_R, **cbs,
+        )
+
+        if use_smoother and kf_ws.x_smo_all is not None:
+            states = smoothed_states(kf_ws)
+            std_N  = smoothed_stds(kf_ws)[:, :n_dp]
+        else:
+            states = filtered_states(kf_ws)
+            std_N  = filtered_stds(kf_ws)[:, :n_dp]
+
+        clip = lambda u: np.clip(u, -50.0, 50.0)
+        return GDEResult(
+            N_all  = np.maximum(states[:, :n_dp],          0.0),
+            GR_all = np.exp(clip(states[:, n_dp:2*n_dp]))  * ws.GR0,
+            J_all  = np.exp(clip(states[:, 2*n_dp]))        * ws.J0,
+            xi_all = np.exp(clip(states[:, 2*n_dp+1:])),
+            std_N  = std_N,
+        )
+
+
+class GDEKalmanSmootherInversion(GDEKalmanInversion):
+    """GDE-EKF + Fixed Interval Kalman Smoother (RTS backward pass)."""
+
+    name = "GDE-FIKS (aerosol dynamics)"
+
+    def solve_series(self, A, count_matrix, dp_grid, use_smoother=True):
+        return super().solve_series(A, count_matrix, dp_grid, use_smoother=True)
+
+
+# ============================================================
 #  Registry  – used by the GUI to populate the combo-box
 # ============================================================
 
@@ -690,6 +976,8 @@ INVERSION_METHODS = {
     AeroInvRegCP.name:              AeroInvRegCP,
     AeroInvCPPoisson.name:          AeroInvCPPoisson,
     AeroInvOzon2020.name:           AeroInvOzon2020,
-    KalmanFilterInversion.name:     KalmanFilterInversion,
-    KalmanSmootherInversion.name:   KalmanSmootherInversion,
+    KalmanFilterInversion.name:       KalmanFilterInversion,
+    KalmanSmootherInversion.name:     KalmanSmootherInversion,
+    GDEKalmanInversion.name:          GDEKalmanInversion,
+    GDEKalmanSmootherInversion.name:  GDEKalmanSmootherInversion,
 }
